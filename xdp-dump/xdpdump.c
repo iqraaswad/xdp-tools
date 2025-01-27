@@ -118,30 +118,6 @@ void addStructElement(struct will_be_used new_element)
 	}
 }
 
-void shiftLeft()
-{
-	if (size == 0) {
-		printf("No elements to shift, array is empty.\n");
-		return;
-	}
-
-	// Shift all elements left by 1
-
-	for (int i = 1; i < size; i++) {
-		buff__table[i - 1] = buff__table[i];
-	}
-
-	// Decrease the size of the array by 1
-
-	// #pragma omp atomic
-	size--;
-
-	// Clear the last element (optional)
-
-	// buff__table[size] = (struct will_be_used){
-	// 	0
-	// }; // Reset the last element to zeroed struct
-}
 
 // Data structure to store flow timing information
 struct flow_info {
@@ -487,64 +463,6 @@ exit:
 #define INITIAL_CAPACITY 1000
 #define MAX_CAPACITY 100000 // Increase maximum capacity to 100,000
 
-// Structure to manage dynamic buffer
-typedef struct {
-	int *data; // Pointer to dynamically allocated memory
-	int size; // Number of elements currently in the buffer
-	int capacity; // Total capacity of the buffer
-} DynamicBuffer;
-
-DynamicBuffer *create_buffer()
-{
-	DynamicBuffer *buffer = (DynamicBuffer *)malloc(sizeof(DynamicBuffer));
-	if (!buffer) {
-		printf("Failed to allocate memory for buffer\n");
-		exit(1);
-	}
-	buffer->data = (int *)malloc(INITIAL_CAPACITY * sizeof(int));
-	if (!buffer->data) {
-		printf("Failed to allocate memory for data\n");
-		exit(1);
-	}
-	buffer->size = 0;
-	buffer->capacity = INITIAL_CAPACITY;
-	return buffer;
-}
-
-void add_to_buffer(DynamicBuffer *buffer, int value)
-{
-	// Resize the buffer if it exceeds the current capacity
-	if (buffer->size == buffer->capacity) {
-		if (buffer->capacity < MAX_CAPACITY) {
-			buffer->capacity *= 2; // Double the capacity
-			if (buffer->capacity > MAX_CAPACITY) {
-				buffer->capacity =
-					MAX_CAPACITY; // Limit to MAX_CAPACITY
-			}
-			buffer->data = (int *)realloc(
-				buffer->data, buffer->capacity * sizeof(int));
-			if (!buffer->data) {
-				printf("Failed to reallocate memory for data\n");
-				exit(1);
-			}
-		} else {
-			printf("Buffer reached maximum capacity.\n");
-			return;
-		}
-	}
-
-	buffer->data[buffer->size++] = value; // Add new value to the buffer
-}
-
-// Function to print the buffer without clearing it
-void print_buffer(DynamicBuffer *buffer)
-{
-	// Print the buffer content
-	for (int i = 0; i < buffer->size; i++) {
-		printf("%d ", buffer->data[i]);
-	}
-	printf("\n");
-}
 
 /*****************************************************************************
  * set_if_promiscuous_mode()
@@ -807,7 +725,6 @@ handle_perf_event(void *private_data, int cpu, struct perf_event_header *event)
 				int dport = ntohs(tcp->th_sport);
 				int sport = ntohs(tcp->th_dport);
 				// #pragma omp critical (flow)
-				
 
 				if (size_tcp >= 20 && ip->ip_p == IPPROTO_TCP) {
 					struct will_be_used new_entry;
@@ -2168,18 +2085,20 @@ static bool capture_on_interface(struct dumpopt *cfg)
 #endif
 
 #pragma omp critical(result)
-{
-	fprintf(stderr, "\n%" PRIu64 " packets captured\n",
-		perf_ctx.captured_packets);
-	fprintf(stderr, "%" PRIu64 " packets dropped by perf ring here, %s\n",
-		perf_ctx.missed_events, cfg->iface.ifname);
-	fprintf(stderr, "Start time : %f \n",
-		start_capture[cfg->iface.ifindex]);
-	fprintf(stderr, "End time : %f \n", end_capture[cfg->iface.ifindex]);
-	fprintf(stderr, "Duration : %f second \n",
-		end_capture[cfg->iface.ifindex] -
+	{
+		fprintf(stderr, "\n%" PRIu64 " packets captured\n",
+			perf_ctx.captured_packets);
+		fprintf(stderr,
+			"%" PRIu64 " packets dropped by perf ring here, %s\n",
+			perf_ctx.missed_events, cfg->iface.ifname);
+		fprintf(stderr, "Start time : %f \n",
 			start_capture[cfg->iface.ifindex]);
-}
+		fprintf(stderr, "End time : %f \n",
+			end_capture[cfg->iface.ifindex]);
+		fprintf(stderr, "Duration : %f second \n",
+			end_capture[cfg->iface.ifindex] -
+				start_capture[cfg->iface.ifindex]);
+	}
 	rc = true;
 
 error_exit:
@@ -2262,18 +2181,10 @@ float network_byte_order_to_float(uint32_t value)
 
 void convert_flow()
 {
-	// while (!exit_xdpdump) {
-	// 	struct flow_tuple flow;
-	// 	memset(&flow, 0, sizeof(flow));
-	// }
-
 	while (!exit_xdpdump) {
-		// #pragma omp critical (flow)
 		{
-			int prediction;
 			struct flow_tuple flow;
 			memset(&flow, 0, sizeof(flow));
-// if (isNew) {
 #pragma omp critical(convertflow)
 			for (int i = 0; i < size; i++) {
 				flow.src_ip = buff__table[i].src_ip.s_addr;
@@ -2796,26 +2707,20 @@ void convert_flow()
 								0;
 
 						flow_entry->bwd_iat_tot += iat;
-						flow_entry->bwd_iat_count += 1;
+						flow_entry->bwd_iat_count++;
 						flow_entry->bwd_iat_avg =
 							(double)(flow_entry
 									 ->bwd_iat_tot /
 								 flow_entry
 									 ->bwd_iat_count);
 						double variance_iat =
-							(flow_entry
-								 ->bwd_ssquare_iat /
-							 flow_entry
-								 ->bwd_iat_count) -
+							(flow_entry->bwd_ssquare_iat /
+							 flow_entry->bwd_iat_count) -
 							(flow_entry->bwd_iat_avg *
-							 flow_entry
-								 ->bwd_iat_avg);
-						flow_entry->bwd_iat_std =
-							sqrt(variance_iat);
-						if (isnan(flow_entry
-								  ->bwd_iat_std))
-							flow_entry->bwd_iat_std =
-								0;
+							 flow_entry->bwd_iat_avg);
+						flow_entry->bwd_iat_std = sqrt(variance_iat);
+						if (isnan(flow_entry->bwd_iat_std))
+							flow_entry->bwd_iat_std = 0;
 					}
 
 					if (flow_entry->flow_iat_min == 0)
@@ -2823,9 +2728,7 @@ void convert_flow()
 					else {
 						if (iat <
 						    flow_entry->flow_iat_min)
-							flow_entry
-								->flow_iat_min =
-								iat;
+							flow_entry->flow_iat_min = iat;
 					}
 
 					if (flow_entry->flow_iat_max == 0)
@@ -2833,12 +2736,10 @@ void convert_flow()
 					else {
 						if (iat >
 						    flow_entry->flow_iat_max)
-							flow_entry
-								->flow_iat_max =
-								iat;
+							flow_entry->flow_iat_max = iat;
 					}
 					flow_entry->flow_iat_tot += iat;
-					flow_entry->flow_iat_count += 1;
+					flow_entry->flow_iat_count++;
 					flow_entry->flow_iat_avg =
 						(double)(flow_entry
 								 ->flow_iat_tot /
@@ -2854,62 +2755,39 @@ void convert_flow()
 					if (isnan(flow_entry->flow_iat_std))
 						flow_entry->flow_iat_std = 0;
 
-					if (flow_entry->flow_pkts_payload_min ==
-					    0)
-						flow_entry
-							->flow_pkts_payload_min =
-							payload_size;
+					if (flow_entry->flow_pkts_payload_min == 0)
+						flow_entry->flow_pkts_payload_min = payload_size;
 					else {
-						if (payload_size <
-						    flow_entry
-							    ->flow_pkts_payload_min)
-							flow_entry
-								->flow_pkts_payload_min =
-								payload_size;
+						if (payload_size < flow_entry->flow_pkts_payload_min)
+							flow_entry->flow_pkts_payload_min = payload_size;
 					}
 
-					if (flow_entry->flow_pkts_payload_max ==
-					    0)
-						flow_entry
-							->flow_pkts_payload_max =
-							payload_size;
+					if (flow_entry->flow_pkts_payload_max == 0)
+						flow_entry->flow_pkts_payload_max = payload_size;
 					else {
-						if (payload_size >
-						    flow_entry
-							    ->flow_pkts_payload_max)
-							flow_entry
-								->flow_pkts_payload_max =
-								payload_size;
+						if (payload_size > flow_entry->flow_pkts_payload_max)
+							flow_entry->flow_pkts_payload_max = payload_size;
 					}
 
 					flow_entry->flow_pkts_payload_tot +=
 						payload_size;
-					flow_entry->flow_pkts_payload_count +=
-						1;
+					flow_entry->flow_pkts_payload_count++;
 					flow_entry->flow_pkts_payload_avg =
-						(double)flow_entry
-							->flow_pkts_payload_tot /
-						(double)flow_entry
-							->flow_pkts_payload_count;
+						(double)flow_entry->flow_pkts_payload_tot /
+						(double)flow_entry->flow_pkts_payload_count;
 
 					flow_entry->ssquare_payload +=
 						(double)(payload_size *
 							 payload_size);
 					double variance =
 						(flow_entry->ssquare_payload /
-						 flow_entry
-							 ->flow_pkts_payload_count) -
-						(flow_entry
-							 ->flow_pkts_payload_avg *
-						 flow_entry
-							 ->flow_pkts_payload_avg);
+						 flow_entry->flow_pkts_payload_count) -
+						(flow_entry->flow_pkts_payload_avg *
+						 flow_entry->flow_pkts_payload_avg);
 					flow_entry->flow_pkts_payload_std =
 						sqrt(variance);
-					if (isnan(flow_entry
-							  ->flow_pkts_payload_std))
-						flow_entry
-							->flow_pkts_payload_std =
-							0;
+					if (isnan(flow_entry->flow_pkts_payload_std))
+						flow_entry->flow_pkts_payload_std = 0;
 
 					double payload_bytes_per_second =
 						flow_entry->total_payload /
@@ -2931,19 +2809,15 @@ void convert_flow()
 					double bwd_bulk_bytes =
 						flow_entry->backward_bulk_size;
 					int fwd_bulk_packets =
-						flow_entry
-							->forward_bulk_packet_count;
+						flow_entry->forward_bulk_packet_count;
 					int bwd_bulk_packets =
-						flow_entry
-							->backward_bulk_packet_count;
+						flow_entry->backward_bulk_packet_count;
 					double fwd_bulk_rate =
 						flow_entry->forward_bulk_size /
-						flow_entry
-							->forward_bulk_duration;
+						flow_entry->forward_bulk_duration;
 					double bwd_bulk_rate =
 						flow_entry->backward_bulk_size /
-						flow_entry
-							->backward_bulk_duration;
+						flow_entry->backward_bulk_duration;
 
 					flow_entry->active_min = 0;
 					flow_entry->active_max = 0;
@@ -2983,37 +2857,24 @@ void convert_flow()
 						down_up_ratio = 0;
 
 					if (buff__table[i].flag & 0x01)
-						flow_entry
-							->flow_FIN_flag_count +=
-							1;
+						flow_entry->flow_FIN_flag_count++;
 
 					if (buff__table[i].flag & 0x02)
-						flow_entry
-							->flow_SYN_flag_count +=
-							1;
+						flow_entry->flow_SYN_flag_count++;
 
 					if (buff__table[i].flag & 0x04)
-						flow_entry
-							->flow_RST_flag_count +=
-							1;
+						flow_entry->flow_RST_flag_count++;
 
 					if (buff__table[i].flag & 0x10)
-						flow_entry
-							->flow_ACK_flag_count +=
-							1;
+						flow_entry->flow_ACK_flag_count++;
 
 					if (buff__table[i].flag & 0x80)
-						flow_entry
-							->flow_CWR_flag_count +=
-							1;
+						flow_entry->flow_CWR_flag_count++;
 
 					if (buff__table[i].flag & 0x40)
-						flow_entry
-							->flow_ECE_flag_count +=
-							1;
+						flow_entry->flow_ECE_flag_count++;
 
-					float input_data_from_function[NUM_FEATURES +
-								       3] = {
+					float input_data_from_function[NUM_FEATURES + 3] = {
 						buff__table[i].src_port,
 						flow_duration,
 						flow_entry->fwd_pkts_tot,
@@ -3024,7 +2885,6 @@ void convert_flow()
 						flow_entry->bwd_pkts_per_sec,
 						flow_pkts_per_sec,
 						down_up_ratio,
-
 						flow_entry->fwd_header_size_tot,
 						flow_entry->fwd_header_size_min,
 						flow_entry->fwd_header_size_max,
@@ -3035,7 +2895,6 @@ void convert_flow()
 						flow_entry->flow_SYN_flag_count,
 						flow_entry->flow_RST_flag_count,
 						flow_entry->fwd_PSH_flag_count,
-
 						flow_entry->bwd_PSH_flag_count,
 						flow_entry->flow_ACK_flag_count,
 						flow_entry->fwd_URG_flag_count,
@@ -3046,24 +2905,17 @@ void convert_flow()
 						flow_entry->fwd_pkts_payload_max,
 						flow_entry->fwd_pkts_payload_tot,
 						flow_entry->fwd_pkts_payload_avg,
-
 						flow_entry->fwd_pkts_payload_std,
 						flow_entry->bwd_pkts_payload_min,
 						flow_entry->bwd_pkts_payload_max,
 						flow_entry->bwd_pkts_payload_tot,
 						flow_entry->bwd_pkts_payload_avg,
 						flow_entry->bwd_pkts_payload_std,
-						flow_entry
-							->flow_pkts_payload_min,
-						flow_entry
-							->flow_pkts_payload_max,
-						flow_entry
-							->flow_pkts_payload_tot,
-						flow_entry
-							->flow_pkts_payload_avg,
-
-						flow_entry
-							->flow_pkts_payload_std,
+						flow_entry->flow_pkts_payload_min,
+						flow_entry->flow_pkts_payload_max,
+						flow_entry->flow_pkts_payload_tot,
+						flow_entry->flow_pkts_payload_avg,
+						flow_entry->flow_pkts_payload_std,
 						flow_entry->fwd_iat_min,
 						flow_entry->fwd_iat_max,
 						flow_entry->fwd_iat_tot,
@@ -3073,7 +2925,6 @@ void convert_flow()
 						flow_entry->bwd_iat_max,
 						flow_entry->bwd_iat_tot,
 						flow_entry->bwd_iat_avg,
-
 						flow_entry->bwd_iat_std,
 						flow_entry->flow_iat_min,
 						flow_entry->flow_iat_max,
@@ -3084,39 +2935,38 @@ void convert_flow()
 						fwd_subflow_pkts,
 						bwd_subflow_pkts,
 						fwd_subflow_bytes,
-
-						bwd_subflow_bytes, //disini 60
-						fwd_bulk_bytes, bwd_bulk_bytes,
+						bwd_subflow_bytes, //60
+						fwd_bulk_bytes,
+						bwd_bulk_bytes,
 						fwd_bulk_packets,
-						bwd_bulk_packets, fwd_bulk_rate,
+						bwd_bulk_packets,
+						fwd_bulk_rate,
 						bwd_bulk_rate,
 						flow_entry->active_min,
 						flow_entry->active_max,
 						flow_entry->active_tot,
-
 						flow_entry->active_avg, //70
 						flow_entry->active_std,
-						idle_min, idle_max, idle_tot,
-						idle_avg, idle_std,
+						idle_min,
+						idle_max,
+						idle_tot,
+						idle_avg,
+						idle_std,
 						fwd_init_window_size,
 						bwd_init_window_size,
 						fwd_last_window_size,
-
-						bwd_last_window_size, 
-						network_byte_order_to_float(
-							buff__table[i]
-								.src_ip.s_addr),
-						network_byte_order_to_float(
-							buff__table[i]
-								.dst_ip.s_addr),
-						buff__table[i].dst_port
-					};
+						bwd_last_window_size,
+						network_byte_order_to_float(buff__table[i].src_ip.s_addr),
+						network_byte_order_to_float(buff__table[i].dst_ip.s_addr),buff__table[i].dst_port};
 					size = 0;
 #pragma omp critical(predict)
 					{
 						if (size_input < 900000) {
 							// #pragma omp for
-							for (int i = 0;i < NUM_FEATURES + 3; i++) {
+							for (int i = 0;
+							     i <
+							     NUM_FEATURES + 3;
+							     i++) {
 								input_data[size_input][i] = input_data_from_function[i];
 							}
 							size_input++;
@@ -3174,12 +3024,12 @@ void handle_predict()
 					strcpy(ip_dst, inet_ntoa(addr2));
 
 					printf("%s, %s, %d, %d, %f - %f, result : %s\n",
-						       ip_src, ip_dst,
-						       (int)input_data[i][0],
-						       (int)input_data[i][83],
-						       start_predict,
-						       end_predict,
-							   (prediction==1) ? "Malicious" : "Benign" );
+					       ip_src, ip_dst,
+					       (int)input_data[i][0],
+					       (int)input_data[i][83],
+					       start_predict, end_predict,
+					       (prediction == 1) ? "Malicious" :
+								   "Benign");
 				}
 				// #pragma omp atomic write
 				size_input = 0;
