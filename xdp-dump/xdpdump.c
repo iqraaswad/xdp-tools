@@ -3,14 +3,20 @@
 /*****************************************************************************
  * Include files
  *****************************************************************************/
+#include "sonar.h"
+#include <omp.h>
+#include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+// #include <mongoc/mongoc.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -43,47 +49,244 @@
 #include "xdpdump.h"
 #include "xpcapng.h"
 #include "compat.h"
-
+#include "math.h"
 /*****************************************************************************
  * Local definitions and global variables
  *****************************************************************************/
 #define PROG_NAME "xdpdump"
 #define DEFAULT_SNAP_LEN 262144
+#define IDLE_TIMEOUT 1000
+#define NUM_FEATURES 81
+#define CLUMP_TIMEOUT 1
+#define BULK_BOUND 4
+bool isNew = 0;
+bool isNewFlow = 0;
+const int subflow_max_iat = 1;
+int total_flow = 0;
 
 #ifndef ENOTSUPP
-#define ENOTSUPP         524 /* Operation is not supported */
+#define ENOTSUPP 524 /* Operation is not supported */
 #endif
 
-#define RX_FLAG_FENTRY (1<<0)
-#define RX_FLAG_FEXIT  (1<<1)
+#define RX_FLAG_FENTRY (1 << 0)
+#define RX_FLAG_FEXIT (1 << 1)
 
-struct flag_val rx_capture_flags[] = {
-	{"entry", RX_FLAG_FENTRY},
-	{"exit", RX_FLAG_FEXIT},
-	{}
+struct flag_val rx_capture_flags[] = { { "entry", RX_FLAG_FENTRY },
+				       { "exit", RX_FLAG_FEXIT },
+				       {} };
+
+struct enum_val xdp_modes[] = { { "native", XDP_MODE_NATIVE },
+				{ "skb", XDP_MODE_SKB },
+				{ "hw", XDP_MODE_HW },
+				{ "unspecified", XDP_MODE_UNSPEC },
+				{ NULL, 0 } };
+
+struct flow_tuple {
+	uint32_t src_ip;
+	uint32_t dst_ip;
+	uint16_t src_port;
+	uint16_t dst_port;
+	uint8_t protocol;
 };
 
-struct enum_val xdp_modes[] = {
-	{"native", XDP_MODE_NATIVE},
-	{"skb", XDP_MODE_SKB},
-	{"hw", XDP_MODE_HW},
-	{"unspecified", XDP_MODE_UNSPEC},
-	{NULL, 0}
+struct will_be_used {
+	int payload_size;
+	struct in_addr src_ip;
+	struct in_addr dst_ip;
+	uint16_t src_port;
+	uint16_t dst_port;
+	uint8_t protocol;
+	bool direction; //1 -> Forward, 0 -> Backward
+	u_int flag;
+	double timestamp;
 };
 
+#define TABLE_SIZE_A 300000
+struct will_be_used buff__table[TABLE_SIZE_A];
+
+int size = 0;
+void addStructElement(struct will_be_used new_element)
+{
+	// #pragma omp critical
+	if (size < TABLE_SIZE_A) {
+		buff__table[size] =
+			new_element; // Add the new element at the end
+		// #pragma omp atomic
+		size++; // Increase the size count
+	} else {
+		printf("Table is full, cannot add more elements.\n");
+	}
+}
+
+void shiftLeft()
+{
+	if (size == 0) {
+		printf("No elements to shift, array is empty.\n");
+		return;
+	}
+
+	// Shift all elements left by 1
+
+	for (int i = 1; i < size; i++) {
+		buff__table[i - 1] = buff__table[i];
+	}
+
+	// Decrease the size of the array by 1
+
+	// #pragma omp atomic
+	size--;
+
+	// Clear the last element (optional)
+
+	// buff__table[size] = (struct will_be_used){
+	// 	0
+	// }; // Reset the last element to zeroed struct
+}
+
+// Data structure to store flow timing information
+struct flow_info {
+	double start_time;
+	double end_time;
+	double ssquare_payload;
+	double fwd_data_pkts_tot;
+	double bwd_data_pkts_tot;
+	double fwd_ssquare_payload;
+	double bwd_ssquare_payload;
+
+	// duplicate features (by cicflowmeter)
+	double fwd_pkt_len_mean;
+	double bwd_pkt_len_mean;
+	double fwd_urg_flags;
+	int fwd_pkts_tot;
+	int bwd_pkts_tot;
+	double totlen_fwd_pkts;
+	double totlen_bwd_pkts;
+
+	// end
+
+	// additional
+
+	double backward_bulk_last_timestamp;
+	double forward_bulk_start_tmp;
+	double forward_bulk_last_timestamp;
+	double forward_bulk_size_tmp;
+	double forward_bulk_count_tmp;
+	double forward_bulk_packet_count;
+	double forward_bulk_count;
+	double forward_bulk_size;
+	double forward_bulk_duration;
+	double backward_bulk_count;
+	double backward_bulk_count_tmp;
+	double backward_bulk_start_tmp;
+	double backward_bulk_size_tmp;
+	double backward_bulk_packet_count;
+	double backward_bulk_size;
+	double backward_bulk_duration;
+
+	// end
+	double fwd_ssquare_iat;
+	double bwd_ssquare_iat;
+	double ssquare_iat;
+
+	float fwd_pkts_per_sec;
+	float bwd_pkts_per_sec;
+	int fwd_header_size_tot;
+	int fwd_header_size_min;
+	int fwd_header_size_max;
+	int bwd_header_size_tot;
+	int bwd_header_size_min;
+	int bwd_header_size_max;
+	int flow_FIN_flag_count;
+	int flow_SYN_flag_count;
+	int flow_RST_flag_count;
+	int fwd_PSH_flag_count;
+	int bwd_PSH_flag_count;
+	int flow_ACK_flag_count;
+	int fwd_URG_flag_count;
+	int bwd_URG_flag_count;
+	int flow_CWR_flag_count;
+	int flow_ECE_flag_count;
+	int fwd_pkts_payload_min;
+	int fwd_pkts_payload_max;
+	int fwd_pkts_payload_count;
+	int fwd_pkts_payload_tot;
+	double fwd_pkts_payload_avg;
+	double fwd_pkts_payload_std;
+	int bwd_pkts_payload_min;
+	int bwd_pkts_payload_max;
+	int bwd_pkts_payload_count;
+	int bwd_pkts_payload_tot;
+	double bwd_pkts_payload_avg;
+	double bwd_pkts_payload_std;
+	int flow_pkts_payload_min;
+	int flow_pkts_payload_max;
+	int flow_pkts_payload_tot;
+	int flow_pkts_payload_count;
+	double flow_pkts_payload_avg;
+	double flow_pkts_payload_std;
+	double fwd_iat_min;
+	double fwd_iat_max;
+	double fwd_iat_tot;
+	double fwd_iat_avg;
+	int fwd_iat_count;
+	double fwd_iat_std;
+
+	double bwd_iat_min;
+	double bwd_iat_max;
+	double bwd_iat_tot;
+	double bwd_iat_avg;
+	int bwd_iat_count;
+	double bwd_iat_std;
+
+	double flow_iat_min;
+	double flow_iat_max;
+	double flow_iat_tot;
+	double flow_iat_avg;
+	int flow_iat_count;
+	double flow_iat_std;
+
+	int total_payload;
+
+	double active_min;
+	double active_max;
+	double active_tot;
+	double active_std;
+	double active_duration;
+	double active_avg;
+};
+
+double start_capture[6] = { 0, 0, 0, 0, 0, 0 };
+double end_capture[6] = { 0, 0, 0, 0, 0, 0 };
+float total_packets_byte = 0;
+
+#define HASH_TABLE_SIZE 900240
+struct flow_info *flow_table[HASH_TABLE_SIZE];
+
+int size_input = 0;
+float input_data[900000][NUM_FEATURES + 3];
+
+unsigned int hash_flow(struct flow_tuple *key)
+{
+	return (key->src_ip ^ key->dst_ip ^ key->src_port ^ key->dst_port ^
+		key->protocol) %
+	       HASH_TABLE_SIZE;
+}
+
+#define n 2
 static const struct dumpopt {
-	bool                  hex_dump;
-	bool                  list_interfaces;
-	bool                  load_xdp;
-	bool                  promiscuous;
-	bool                  use_pcap;
-	struct iface          iface;
-	uint32_t              perf_wakeup;
-	uint32_t              snaplen;
-	char                 *pcap_file;
-	char                 *program_names;
-	unsigned int          load_xdp_mode;
-	unsigned int          rx_capture;
+	bool hex_dump;
+	bool list_interfaces;
+	bool load_xdp;
+	bool promiscuous;
+	bool use_pcap;
+	struct iface iface;
+	struct iface iface2;
+	uint32_t perf_wakeup;
+	uint32_t snaplen;
+	char *pcap_file;
+	char *program_names;
+	unsigned int load_xdp_mode;
+	unsigned int rx_capture;
 } defaults_dumpopt = {
 	.hex_dump = false,
 	.list_interfaces = false,
@@ -95,57 +298,58 @@ static const struct dumpopt {
 	.rx_capture = RX_FLAG_FENTRY,
 };
 struct dumpopt cfg_dumpopt;
+struct dumpopt cfg_dumpopt2;
 
+/* ethernet headers are always exactly 14 bytes */
+#define SIZE_ETHERNET 14
+const struct sniff_tcp *tcp;
+u_int size_ip;
+u_int size_tcp;
+u_int flag;
 static struct prog_option xdpdump_options[] = {
 	DEFINE_OPTION("rx-capture", OPT_FLAGS, struct dumpopt, rx_capture,
-		      .metavar = "<mode>",
-		      .typearg = rx_capture_flags,
+		      .metavar = "<mode>", .typearg = rx_capture_flags,
 		      .help = "Capture point for the rx direction"),
 	DEFINE_OPTION("list-interfaces", OPT_BOOL, struct dumpopt,
-		      list_interfaces,
-		      .short_opt = 'D',
+		      list_interfaces, .short_opt = 'D',
 		      .help = "Print the list of available interfaces"),
 	DEFINE_OPTION("load-xdp-mode", OPT_ENUM, struct dumpopt, load_xdp_mode,
-		      .typearg = xdp_modes,
-		      .metavar = "<mode>",
+		      .typearg = xdp_modes, .metavar = "<mode>",
 		      .help = "Mode used for --load-xdp-mode, default native"),
-	DEFINE_OPTION("load-xdp-program", OPT_BOOL, struct dumpopt, load_xdp,
-		      .help = "Load XDP trace program if no XDP program is loaded"),
+	DEFINE_OPTION(
+		"load-xdp-program", OPT_BOOL, struct dumpopt, load_xdp,
+		.help = "Load XDP trace program if no XDP program is loaded"),
 	DEFINE_OPTION("interface", OPT_IFNAME, struct dumpopt, iface,
-		      .short_opt = 'i',
-		      .metavar = "<ifname>",
+		      .short_opt = 'i', .metavar = "<ifname>",
 		      .help = "Name of interface to capture on"),
+	DEFINE_OPTION("second interface", OPT_IFNAME, struct dumpopt, iface2,
+		      .short_opt = 'j', .metavar = "<ifnames>",
+		      .help = "Name of second interface to capture on"),
 #ifdef HAVE_LIBBPF_PERF_BUFFER__CONSUME
 	DEFINE_OPTION("perf-wakeup", OPT_U32, struct dumpopt, perf_wakeup,
 		      .metavar = "<events>",
 		      .help = "Wake up xdpdump every <events> packets"),
 #endif
 	DEFINE_OPTION("program-names", OPT_STRING, struct dumpopt,
-		      program_names,
-		      .short_opt = 'p',
-		      .metavar = "<prog>",
+		      program_names, .short_opt = 'p', .metavar = "<prog>",
 		      .help = "Specific program to attach to"),
-	DEFINE_OPTION("promiscuous-mode", OPT_BOOL, struct dumpopt,
-		      promiscuous,
+	DEFINE_OPTION("promiscuous-mode", OPT_BOOL, struct dumpopt, promiscuous,
 		      .short_opt = 'P',
 		      .help = "Open interface in promiscuous mode"),
 	DEFINE_OPTION("snapshot-length", OPT_U32, struct dumpopt, snaplen,
-		      .short_opt = 's',
-		      .metavar = "<snaplen>",
+		      .short_opt = 's', .metavar = "<snaplen>",
 		      .help = "Minimum bytes of packet to capture"),
 	DEFINE_OPTION("use-pcap", OPT_BOOL, struct dumpopt, use_pcap,
 		      .help = "Use legacy pcap format for XDP traces"),
 	DEFINE_OPTION("write", OPT_STRING, struct dumpopt, pcap_file,
-		      .short_opt = 'w',
-		      .metavar = "<file>",
+		      .short_opt = 'w', .metavar = "<file>",
 		      .help = "Write raw packets to pcap file"),
 	DEFINE_OPTION("hex", OPT_BOOL, struct dumpopt, hex_dump,
-		      .short_opt = 'x',
-		      .help = "Print the full packet in hex"),
+		      .short_opt = 'x', .help = "Print the full packet in hex"),
 	END_OPTIONS
 };
 
-#define MAX_LOADED_XDP_PROGRAMS  (MAX_DISPATCHER_ACTIONS + 1)
+#define MAX_LOADED_XDP_PROGRAMS (MAX_DISPATCHER_ACTIONS + 1)
 
 struct capture_programs {
 	/* Contains a list of programs to capture on, with the respective
@@ -154,32 +358,34 @@ struct capture_programs {
 	unsigned int nr_of_progs;
 	struct prog_info {
 		struct xdp_program *prog;
-		const char         *func;
-		unsigned int        rx_capture;
+		const char *func;
+		unsigned int rx_capture;
 		/* Fields used by the actual loader. */
-		bool                attached;
-		int                 perf_map_fd;
-		struct bpf_object  *prog_obj;
-		struct bpf_link    *fentry_link;
-		struct bpf_link    *fexit_link;
+		bool attached;
+		int perf_map_fd;
+		struct bpf_object *prog_obj;
+		struct bpf_link *fentry_link;
+		struct bpf_link *fexit_link;
 	} progs[MAX_LOADED_XDP_PROGRAMS];
 };
 
 struct perf_handler_ctx {
-	uint64_t                 missed_events;
-	uint64_t                 last_missed_events;
-	uint64_t                 captured_packets;
-	uint64_t                 epoch_delta;
-	uint64_t                 packet_id;
-	uint64_t                 cpu_packet_id[MAX_CPUS];
-	struct dumpopt          *cfg;
+	uint64_t missed_events;
+	uint64_t last_missed_events;
+	uint64_t captured_packets;
+	uint64_t epoch_delta;
+	uint64_t packet_id;
+	uint64_t cpu_packet_id[MAX_CPUS];
+	FILE *output_file;
+	struct dumpopt *cfg;
 	struct capture_programs *xdp_progs;
-	pcap_t                  *pcap;
-	pcap_dumper_t           *pcap_dumper;
-	struct xpcapng_dumper   *pcapng_dumper;
+	pcap_t *pcap;
+	pcap_dumper_t *pcap_dumper;
+	struct xpcapng_dumper *pcapng_dumper;
 };
 
-bool    exit_xdpdump;
+int a = 1;
+bool exit_xdpdump;
 pcap_t *exit_pcap;
 
 /*****************************************************************************
@@ -189,11 +395,11 @@ static uint64_t get_if_speed(struct iface *iface)
 {
 #define MAX_MODE_MASKS 10
 
-	int                                  fd;
-	struct ifreq                         ifr;
+	int fd;
+	struct ifreq ifr;
 	struct {
 		struct ethtool_link_settings req;
-		uint32_t                     modes[3 * MAX_MODE_MASKS];
+		uint32_t modes[3 * MAX_MODE_MASKS];
 	} ereq;
 
 	if (iface == NULL)
@@ -242,10 +448,10 @@ error_exit:
  *****************************************************************************/
 static char *get_if_drv_info(struct iface *iface, char *buffer, size_t len)
 {
-	int                     fd;
-	char                   *r_buffer = NULL;
-	struct ifreq            ifr;
-	struct ethtool_drvinfo  info;
+	int fd;
+	char *r_buffer = NULL;
+	struct ifreq ifr;
+	struct ethtool_drvinfo info;
 
 	if (iface == NULL || buffer == NULL || len == 0)
 		return NULL;
@@ -278,14 +484,76 @@ exit:
 	return r_buffer;
 }
 
+#define INITIAL_CAPACITY 1000
+#define MAX_CAPACITY 100000 // Increase maximum capacity to 100,000
+
+// Structure to manage dynamic buffer
+typedef struct {
+	int *data; // Pointer to dynamically allocated memory
+	int size; // Number of elements currently in the buffer
+	int capacity; // Total capacity of the buffer
+} DynamicBuffer;
+
+DynamicBuffer *create_buffer()
+{
+	DynamicBuffer *buffer = (DynamicBuffer *)malloc(sizeof(DynamicBuffer));
+	if (!buffer) {
+		printf("Failed to allocate memory for buffer\n");
+		exit(1);
+	}
+	buffer->data = (int *)malloc(INITIAL_CAPACITY * sizeof(int));
+	if (!buffer->data) {
+		printf("Failed to allocate memory for data\n");
+		exit(1);
+	}
+	buffer->size = 0;
+	buffer->capacity = INITIAL_CAPACITY;
+	return buffer;
+}
+
+void add_to_buffer(DynamicBuffer *buffer, int value)
+{
+	// Resize the buffer if it exceeds the current capacity
+	if (buffer->size == buffer->capacity) {
+		if (buffer->capacity < MAX_CAPACITY) {
+			buffer->capacity *= 2; // Double the capacity
+			if (buffer->capacity > MAX_CAPACITY) {
+				buffer->capacity =
+					MAX_CAPACITY; // Limit to MAX_CAPACITY
+			}
+			buffer->data = (int *)realloc(
+				buffer->data, buffer->capacity * sizeof(int));
+			if (!buffer->data) {
+				printf("Failed to reallocate memory for data\n");
+				exit(1);
+			}
+		} else {
+			printf("Buffer reached maximum capacity.\n");
+			return;
+		}
+	}
+
+	buffer->data[buffer->size++] = value; // Add new value to the buffer
+}
+
+// Function to print the buffer without clearing it
+void print_buffer(DynamicBuffer *buffer)
+{
+	// Print the buffer content
+	for (int i = 0; i < buffer->size; i++) {
+		printf("%d ", buffer->data[i]);
+	}
+	printf("\n");
+}
+
 /*****************************************************************************
  * set_if_promiscuous_mode()
  *****************************************************************************/
 static int set_if_promiscuous_mode(struct iface *iface, bool enable,
 				   bool *did_enable)
 {
-	int          fd;
-	int          rc = 0;
+	int fd;
+	int rc = 0;
 	struct ifreq ifr;
 
 	if (iface == NULL)
@@ -359,7 +627,7 @@ static const char *get_xdp_action_string(enum xdp_action act)
  *****************************************************************************/
 static const char *get_capture_mode_string(unsigned int mode)
 {
-	switch(mode) {
+	switch (mode) {
 	case RX_FLAG_FENTRY:
 		return "entry";
 	case RX_FLAG_FEXIT:
@@ -373,26 +641,28 @@ static const char *get_capture_mode_string(unsigned int mode)
 /*****************************************************************************
  * snprinth()
  *****************************************************************************/
-#define SNPRINTH_MIN_BUFFER_SIZE sizeof("0xffff:  00 11 22 33 44 55 66 77 88" \
-					" 99 aa bb cc dd ee ff	" \
-					"................0")
+#define SNPRINTH_MIN_BUFFER_SIZE                     \
+	sizeof("0xffff:  00 11 22 33 44 55 66 77 88" \
+	       " 99 aa bb cc dd ee ff	"              \
+	       "................0")
 
-static int snprinth(char *str, size_t size,
-		    const uint8_t *buffer, size_t buffer_size, size_t offset)
+static int snprinth(char *str, size_t size, const uint8_t *buffer,
+		    size_t buffer_size, size_t offset)
 {
 	int i;
 	int pre_skip;
 	int post_skip;
 	size_t zero_offset;
 
-	if (str == NULL || size < SNPRINTH_MIN_BUFFER_SIZE ||
-	    buffer == NULL || offset >= buffer_size || buffer_size > 0xffff)
+	if (str == NULL || size < SNPRINTH_MIN_BUFFER_SIZE || buffer == NULL ||
+	    offset >= buffer_size || buffer_size > 0xffff)
 		return -EINVAL;
 
 	zero_offset = offset & ~0xf;
 	pre_skip = offset & 0xf;
-	post_skip = (zero_offset + 0xf) < buffer_size ? \
-		0 : 16 - (buffer_size - zero_offset);
+	post_skip = (zero_offset + 0xf) < buffer_size ?
+			    0 :
+			    16 - (buffer_size - zero_offset);
 
 	/* Print offset */
 	snprintf(str, size, "0x%04zx:  ", offset & 0xfff0);
@@ -405,8 +675,7 @@ static int snprinth(char *str, size_t size,
 	}
 
 	for (i = pre_skip; i < 16 - post_skip; i++) {
-		snprintf(str + (i * 3), 5, "%02x ",
-			 buffer[zero_offset + i]);
+		snprintf(str + (i * 3), 5, "%02x ", buffer[zero_offset + i]);
 	}
 
 	if (post_skip) {
@@ -423,8 +692,9 @@ static int snprinth(char *str, size_t size,
 		str[pre_skip] = 0;
 	}
 	for (i = pre_skip; i < 16 - post_skip; i++)
-		str[i] = isprint(buffer[zero_offset + i]) ? \
-			buffer[zero_offset + i]: '.';
+		str[i] = isprint(buffer[zero_offset + i]) ?
+				 buffer[zero_offset + i] :
+				 '.';
 
 	str[i] = 0;
 	return 0;
@@ -433,28 +703,27 @@ static int snprinth(char *str, size_t size,
 /*****************************************************************************
  * handle_perf_event()
  *****************************************************************************/
-static enum bpf_perf_event_ret handle_perf_event(void *private_data,
-						 int cpu,
-						 struct perf_event_header *event)
+static enum bpf_perf_event_ret
+handle_perf_event(void *private_data, int cpu, struct perf_event_header *event)
 {
-	uint64_t                  ts;
-	bool                      fexit;
-	unsigned int              if_idx, prog_idx;
-	const char               *xdp_func;
-	struct perf_handler_ctx  *ctx = private_data;
-	struct perf_sample_event *e = container_of(event,
-						   struct perf_sample_event,
-						   header);
-	struct perf_lost_event   *lost = container_of(event,
-						      struct perf_lost_event,
-						      header);
+	uint64_t ts;
+	bool fexit;
+	unsigned int if_idx, prog_idx;
+	const char *xdp_func;
+	struct sniff_ip *ip = NULL;
+	struct perf_handler_ctx *ctx = private_data;
+	struct perf_sample_event *e =
+		container_of(event, struct perf_sample_event, header);
+	struct perf_lost_event *lost =
+		container_of(event, struct perf_lost_event, header);
 
-	switch(e->header.type) {
+	switch (e->header.type) {
 	case PERF_RECORD_SAMPLE:
 
 		if (cpu >= MAX_CPUS ||
 		    e->header.size < sizeof(struct perf_sample_event) ||
-		    e->size < (sizeof(struct pkt_trace_metadata) + e->metadata.cap_len) ||
+		    e->size < (sizeof(struct pkt_trace_metadata) +
+			       e->metadata.cap_len) ||
 		    e->metadata.prog_index >= ctx->xdp_progs->nr_of_progs)
 			return LIBBPF_PERF_EVENT_CONT;
 
@@ -464,15 +733,15 @@ static enum bpf_perf_event_ret handle_perf_event(void *private_data,
 		xdp_func = ctx->xdp_progs->progs[prog_idx].func;
 
 		if (prog_idx == 0 &&
-		    (!fexit ||
-		     ctx->xdp_progs->progs[prog_idx].rx_capture == RX_FLAG_FEXIT))
+		    (!fexit || ctx->xdp_progs->progs[prog_idx].rx_capture ==
+				       RX_FLAG_FEXIT))
 			ctx->cpu_packet_id[cpu] = ++ctx->packet_id;
 
 		ts = e->time + ctx->epoch_delta;
 
 		if (ctx->pcapng_dumper) {
 			struct xpcapng_epb_options_s options = {};
-			int64_t  action = e->metadata.action;
+			int64_t action = e->metadata.action;
 			uint32_t queue = e->metadata.rx_queue;
 
 			options.flags = PCAPNG_EPB_FLAG_INBOUND;
@@ -481,14 +750,11 @@ static enum bpf_perf_event_ret handle_perf_event(void *private_data,
 			options.queue = &queue;
 			options.xdp_verdict = fexit ? &action : NULL;
 
-			xpcapng_dump_enhanced_pkt(ctx->pcapng_dumper,
-						  if_idx,
-						  e->packet,
-						  e->metadata.pkt_len,
-						  min(e->metadata.cap_len,
-						      ctx->cfg->snaplen),
-						  ts,
-						  &options);
+			xpcapng_dump_enhanced_pkt(
+				ctx->pcapng_dumper, if_idx, e->packet,
+				e->metadata.pkt_len,
+				min(e->metadata.cap_len, ctx->cfg->snaplen), ts,
+				&options);
 
 			ctx->last_missed_events = 0;
 			if (ctx->cfg->pcap_file[0] == '-' &&
@@ -501,54 +767,83 @@ static enum bpf_perf_event_ret handle_perf_event(void *private_data,
 			h.ts.tv_usec = ts % 1000000000ULL / 1000;
 			h.caplen = min(e->metadata.cap_len, ctx->cfg->snaplen);
 			h.len = e->metadata.pkt_len;
-			pcap_dump((u_char *) ctx->pcap_dumper, &h,
-				  e->packet);
+			pcap_dump((u_char *)ctx->pcap_dumper, &h, e->packet);
 
 			if (ctx->cfg->pcap_file[0] == '-' &&
 			    ctx->cfg->pcap_file[1] == 0)
 				pcap_dump_flush(ctx->pcap_dumper);
 		} else {
-			int  i;
+			int i;
 			char hline[SNPRINTH_MIN_BUFFER_SIZE];
 
 			if (ctx->cfg->hex_dump) {
 				printf("%llu.%09lld: %s()@%s%s: packet size %u "
 				       "bytes, captured %u bytes on if_index "
-				       "%u, rx queue %u, id %"PRIu64"\n",
-				       ts / 1000000000ULL,
-				       ts % 1000000000ULL,
-				       xdp_func,
-				       fexit ? "exit" : "entry",
+				       "%u, rx queue %u, id %" PRIu64 "\n",
+				       ts / 1000000000ULL, ts % 1000000000ULL,
+				       xdp_func, fexit ? "exit" : "entry",
 				       fexit ? get_xdp_action_string(
-					       e->metadata.action) : "",
-				       e->metadata.pkt_len,
-				       e->metadata.cap_len,
+						       e->metadata.action) :
+					       "",
+				       e->metadata.pkt_len, e->metadata.cap_len,
 				       e->metadata.ifindex,
 				       e->metadata.rx_queue,
 				       ctx->cpu_packet_id[cpu]);
 
 				for (i = 0; i < e->metadata.cap_len; i += 16) {
 					snprinth(hline, sizeof(hline),
-						 e->packet,
-						 e->metadata.cap_len, i);
+						 e->packet, e->metadata.cap_len,
+						 i);
 					printf("  %s\n", hline);
 				}
 			} else {
-				printf("%llu.%09lld: %s()@%s%s: packet size %u "
-				       "bytes on if_index %u, rx queue %u, "
-				       "id %"PRIu64"\n",
-				       ts / 1000000000ULL,
-				       ts % 1000000000ULL,
-				       xdp_func,
-				       fexit ? "exit" : "entry",
-				       fexit ? get_xdp_action_string(
-					       e->metadata.action) : "",
-				       e->metadata.pkt_len,e->metadata.ifindex,
-				       e->metadata.rx_queue,
-				       ctx->cpu_packet_id[cpu]);
+				ip = (struct sniff_ip *)(e->packet +
+							 SIZE_ETHERNET);
+				size_ip = IP_HL(ip) * 4;
+				tcp = (struct sniff_tcp *)(e->packet +
+							   SIZE_ETHERNET +
+							   size_ip);
+				size_tcp = TH_OFF(tcp) * 4;
+				int dport = ntohs(tcp->th_sport);
+				int sport = ntohs(tcp->th_dport);
+				// #pragma omp critical (flow)
+				
+
+				if (size_tcp >= 20 && ip->ip_p == IPPROTO_TCP) {
+					struct will_be_used new_entry;
+					new_entry.payload_size = ip->ip_len;
+					new_entry.timestamp = omp_get_wtime();
+					new_entry.flag = flag;
+					new_entry.protocol = 6;
+
+					if (dport == 443) //Forward
+					{
+						new_entry.src_ip = ip->ip_src;
+						new_entry.dst_ip = ip->ip_dst;
+						new_entry.src_port = dport;
+						new_entry.dst_port = sport;
+						new_entry.direction = 1;
+					};
+
+					if (sport == 443) //Backward
+					{
+						new_entry.src_ip = ip->ip_dst;
+						new_entry.dst_ip = ip->ip_src;
+						new_entry.src_port = sport;
+						new_entry.dst_port = dport;
+						new_entry.direction = 0;
+					};
+
+#pragma omp critical(convertflow)
+					addStructElement(new_entry);
+
+					ctx->captured_packets++;
+
+					isNew = true;
+				}
 			}
 		}
-		ctx->captured_packets++;
+
 		break;
 
 	case PERF_RECORD_LOST:
@@ -563,41 +858,36 @@ static enum bpf_perf_event_ret handle_perf_event(void *private_data,
 /*****************************************************************************
  * get_epoch_to_uptime_delta()
  *****************************************************************************/
-static int get_epoch_to_uptime_delta(uint64_t *delta)
-{
-	/* This function will calculate the rough delta between uptime
-	 * seconds and the epoch time. This is not a precise delta as there is
-	 * a delay between calling the two functions below (and time() being in
-	 * seconds), but it's good enough to get a general offset. The delta
-	 * between packets is still based on the timestamps from the trace
-	 * infrastructure.
-	 */
-	struct timespec ts;
-	uint64_t        uptime;
-	uint64_t        epoch = time(NULL) * 1000000000ULL;
+// static uint64_t get_epoch_to_uptime_delta(void)
+// {
+// 	/* This function will calculate the rough delta between uptime
+// 	 * seconds and the epoch time. This is not a precise delta as there is
+// 	 * a delay between calling the two functions below (and time() being in
+// 	 * seconds), but it's good enough to get a general offset. The delta
+// 	 * between packets is still based on the timestamps from the trace
+// 	 * infrastructure.
+// 	 */
+// 	struct timespec ts;
+// 	uint64_t uptime;
+// 	uint64_t epoch = time(NULL) * 1000000000ULL;
 
-	if (clock_gettime(CLOCK_MONOTONIC, &ts)) {
-		pr_warn("ERROR: Failed to get CLOCK_MONOTONIC time: %s(%d)",
-			strerror(errno), errno);
-		return -errno;
-	}
-	uptime = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+// 	clock_gettime(CLOCK_MONOTONIC, &ts);
+// 	uptime = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
-	*delta = epoch - uptime;
-	return 0;
-}
+// 	return epoch - uptime;
+// }
 
 /*****************************************************************************
  * capture_on_legacy_interface()
  *****************************************************************************/
 static bool capture_on_legacy_interface(struct dumpopt *cfg)
 {
-	bool              rc = false;
-	char              errbuf[PCAP_ERRBUF_SIZE];
-	uint64_t          captured_packets = 0;
-	pcap_t           *pcap = NULL;
-	pcap_dumper_t    *pcap_dumper = NULL;
-	struct pcap_stat  ps;
+	bool rc = false;
+	char errbuf[PCAP_ERRBUF_SIZE];
+	uint64_t captured_packets = 0;
+	pcap_t *pcap = NULL;
+	pcap_dumper_t *pcap_dumper = NULL;
+	struct pcap_stat ps;
 
 	/* Open pcap handle for live capture. */
 	if (cfg->rx_capture != RX_FLAG_FENTRY) {
@@ -606,8 +896,8 @@ static bool capture_on_legacy_interface(struct dumpopt *cfg)
 		goto error_exit;
 	}
 
-	pcap = pcap_open_live(cfg->iface.ifname, cfg->snaplen,
-			      cfg->promiscuous, 1000, errbuf);
+	pcap = pcap_open_live(cfg->iface.ifname, cfg->snaplen, cfg->promiscuous,
+			      1000, errbuf);
 	if (pcap == NULL) {
 		pr_warn("ERROR: Can't open pcap live interface: %s\n", errbuf);
 		goto error_exit;
@@ -623,8 +913,10 @@ static bool capture_on_legacy_interface(struct dumpopt *cfg)
 	}
 
 	/* No more error conditions, display some capture information */
-	fprintf(stderr, "listening on %s, link-type %s (%s), "
-		"capture size %d bytes\n", cfg->iface.ifname,
+	fprintf(stderr,
+		"listening on %s, link-type %s (%s), "
+		"capture size %d bytes\n",
+		cfg->iface.ifname,
 		pcap_datalink_val_to_name(pcap_datalink(pcap)),
 		pcap_datalink_val_to_description(pcap_datalink(pcap)),
 		cfg->snaplen);
@@ -632,15 +924,15 @@ static bool capture_on_legacy_interface(struct dumpopt *cfg)
 	/* Loop for receive packets on live interface. */
 	exit_pcap = pcap;
 	while (!exit_xdpdump) {
-		const uint8_t      *packet;
-		struct pcap_pkthdr  h;
+		const uint8_t *packet;
+		struct pcap_pkthdr h;
 
 		packet = pcap_next(pcap, &h);
 		if (!packet)
 			continue;
 
 		if (pcap_dumper) {
-			pcap_dump((u_char *) pcap_dumper, &h, packet);
+			pcap_dump((u_char *)pcap_dumper, &h, packet);
 
 			if (cfg->pcap_file[0] == '-' && cfg->pcap_file[1] == 0)
 				pcap_dump_flush(pcap_dumper);
@@ -651,18 +943,18 @@ static bool capture_on_legacy_interface(struct dumpopt *cfg)
 			if (cfg->hex_dump) {
 				printf("%ld.%06ld: packet size %u bytes, "
 				       "captured %u bytes on if_name \"%s\"\n",
-				       (long) h.ts.tv_sec, (long) h.ts.tv_usec,
+				       (long)h.ts.tv_sec, (long)h.ts.tv_usec,
 				       h.len, h.caplen, cfg->iface.ifname);
 
 				for (i = 0; i < h.caplen; i += 16) {
-					snprinth(hline, sizeof(hline),
-						 packet, h.caplen, i);
+					snprinth(hline, sizeof(hline), packet,
+						 h.caplen, i);
 					printf("  %s\n", hline);
 				}
 			} else {
 				printf("%ld.%06ld: packet size %u bytes on "
 				       "if_name \"%s\"\n",
-				       (long) h.ts.tv_sec, (long) h.ts.tv_usec,
+				       (long)h.ts.tv_sec, (long)h.ts.tv_usec,
 				       h.len, cfg->iface.ifname);
 			}
 		}
@@ -671,7 +963,7 @@ static bool capture_on_legacy_interface(struct dumpopt *cfg)
 	exit_pcap = NULL;
 	rc = true;
 
-	fprintf(stderr, "\n%"PRIu64" packets captured\n", captured_packets);
+	fprintf(stderr, "\n%" PRIu64 " packets captured\n", captured_packets);
 	if (pcap_stats(pcap, &ps) == 0) {
 		fprintf(stderr, "%u packets dropped by kernel\n", ps.ps_drop);
 		if (ps.ps_ifdrop != 0)
@@ -696,7 +988,7 @@ error_exit:
 int append_snprintf(char **buf, size_t *buf_len, size_t *offset,
 		    const char *format, ...)
 {
-	int     len;
+	int len;
 	va_list args;
 
 	if (buf == NULL || *buf == NULL || buf_len == NULL || *buf_len <= 0 ||
@@ -704,11 +996,12 @@ int append_snprintf(char **buf, size_t *buf_len, size_t *offset,
 		return -EINVAL;
 
 	while (true) {
-		char   *new_buf;
-		size_t  new_buf_len;
+		char *new_buf;
+		size_t new_buf_len;
 
 		va_start(args, format);
-		len = vsnprintf(*buf + *offset, *buf_len - *offset, format, args);
+		len = vsnprintf(*buf + *offset, *buf_len - *offset, format,
+				args);
 		va_end(args);
 
 		if ((size_t)len < (*buf_len - *offset)) {
@@ -735,11 +1028,12 @@ int append_snprintf(char **buf, size_t *buf_len, size_t *offset,
 /*****************************************************************************
  * get_program_names_all()
  *****************************************************************************/
-static char *get_program_names_all(struct capture_programs *progs, int skip_index)
+static char *get_program_names_all(struct capture_programs *progs,
+				   int skip_index)
 {
-	char   *program_names;
-	size_t  size = 128;
-	size_t  offset = 0;
+	char *program_names;
+	size_t size = 128;
+	size_t offset = 0;
 
 	program_names = malloc(size);
 	if (!program_names)
@@ -772,10 +1066,9 @@ static char *get_program_names_all(struct capture_programs *progs, int skip_inde
 /*****************************************************************************
  * find_func_matches()
  *****************************************************************************/
-static size_t find_func_matches(const struct btf *btf,
-				const char *func_name,
-				const char **found_name,
-				bool print, int print_id, bool exact)
+static size_t find_func_matches(const struct btf *btf, const char *func_name,
+				const char **found_name, bool print,
+				int print_id, bool exact)
 {
 	const struct btf_type *t, *match;
 	size_t len, matches = 0;
@@ -797,8 +1090,8 @@ static size_t find_func_matches(const struct btf *btf,
 
 		name = btf__name_by_offset(btf, t->name_off);
 		if (!strncmp(name, func_name, len)) {
-			pr_debug("Found func %s matching %s\n",
-				 name, func_name);
+			pr_debug("Found func %s matching %s\n", name,
+				 func_name);
 
 			if (print) {
 				if (print_id < 0)
@@ -840,26 +1133,30 @@ static int match_target_function(struct dumpopt *cfg,
 				 struct capture_programs *all_progs,
 				 char *prog_name, int prog_id)
 {
-	int          i;
+	int i;
 	unsigned int matches = 0;
 
 	for (i = 0; i < (int)all_progs->nr_of_progs; i++) {
 		const char *kname = xdp_program__name(all_progs->progs[i].prog);
 
 		if (prog_id != -1 &&
-		    xdp_program__id(all_progs->progs[i].prog) != (uint32_t) prog_id)
+		    xdp_program__id(all_progs->progs[i].prog) !=
+			    (uint32_t)prog_id)
 			continue;
 
 		if (!strncmp(kname, prog_name, strlen(kname))) {
 			if (all_progs->progs[i].func == NULL) {
-				if (find_func_matches(xdp_program__btf(all_progs->progs[i].prog),
-						      prog_name,
-						      &all_progs->progs[i].func,
-						      false, -1,
-						      true) == 1) {
-					all_progs->progs[i].rx_capture = cfg->rx_capture;
+				if (find_func_matches(
+					    xdp_program__btf(
+						    all_progs->progs[i].prog),
+					    prog_name,
+					    &all_progs->progs[i].func, false,
+					    -1, true) == 1) {
+					all_progs->progs[i].rx_capture =
+						cfg->rx_capture;
 					matches++;
-				} else if (strlen(prog_name) <= BPF_OBJ_NAME_LEN - 1) {
+				} else if (strlen(prog_name) <=
+					   BPF_OBJ_NAME_LEN - 1) {
 					/* If the user cut and paste the
 					 * truncated function name, make sure
 					 * we tell him all the possible options!
@@ -867,8 +1164,10 @@ static int match_target_function(struct dumpopt *cfg,
 					matches = UINT_MAX;
 					break;
 				}
-			} else if (!strcmp(all_progs->progs[i].func, prog_name)) {
-				all_progs->progs[i].rx_capture = cfg->rx_capture;
+			} else if (!strcmp(all_progs->progs[i].func,
+					   prog_name)) {
+				all_progs->progs[i].rx_capture =
+					cfg->rx_capture;
 				matches++;
 			}
 		}
@@ -903,17 +1202,19 @@ static int match_target_function(struct dumpopt *cfg,
 	pr_warn("The following is a list of candidates:\n");
 
 	for (i = 0; i < (int)all_progs->nr_of_progs; i++) {
-		uint32_t    cur_prog_id = xdp_program__id(all_progs->progs[i].prog);
+		uint32_t cur_prog_id =
+			xdp_program__id(all_progs->progs[i].prog);
 		const char *func_dummy;
 
-		if (prog_id != -1 && cur_prog_id != (uint32_t) prog_id)
+		if (prog_id != -1 && cur_prog_id != (uint32_t)prog_id)
 			continue;
 
 		find_func_matches(xdp_program__btf(all_progs->progs[i].prog),
 				  xdp_program__name(all_progs->progs[i].prog),
 				  &func_dummy, true,
-				  (prog_id == -1 &&
-				   matches == UINT_MAX) ? -1 : (int) cur_prog_id,
+				  (prog_id == -1 && matches == UINT_MAX) ?
+					  -1 :
+					  (int)cur_prog_id,
 				  false);
 
 		if (prog_id != -1)
@@ -933,7 +1234,6 @@ static int match_target_function(struct dumpopt *cfg,
 
 	return -EAGAIN;
 }
-
 
 /*****************************************************************************
  * check_btf()
@@ -963,13 +1263,13 @@ static bool check_btf(struct xdp_program *prog)
 static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 		       struct capture_programs *tgt_progs)
 {
-	const char              *func;
-	struct xdp_program      *prog, *p;
-	struct capture_programs  progs;
-	size_t                   matches;
-	char                    *prog_name;
-	char                    *prog_safe_ptr;
-	char                    *program_names = cfg->program_names;
+	const char *func;
+	struct xdp_program *prog, *p;
+	struct capture_programs progs;
+	size_t matches;
+	char *prog_name;
+	char *prog_safe_ptr;
+	char *program_names = cfg->program_names;
 
 	prog = xdp_multiprog__main_prog(mp);
 	if (!check_btf(prog))
@@ -989,8 +1289,8 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 		}
 
 		matches = find_func_matches(xdp_program__btf(prog),
-					    xdp_program__name(prog),
-					    &func, false, -1, false);
+					    xdp_program__name(prog), &func,
+					    false, -1, false);
 
 		if (!matches) {
 			pr_warn("ERROR: Can't find function '%s' on interface!\n",
@@ -1008,8 +1308,8 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 			"The following is a list of candidates:\n");
 
 		find_func_matches(xdp_program__btf(prog),
-				  xdp_program__name(prog),
-				  &func, true, -1, false);
+				  xdp_program__name(prog), &func, true, -1,
+				  false);
 
 		pr_warn("Please use the -p option to pick the correct one.\n");
 		return -EAGAIN;
@@ -1030,21 +1330,18 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 	progs.progs[progs.nr_of_progs].prog = prog;
 	matches = find_func_matches(xdp_program__btf(prog),
 				    xdp_program__name(prog),
-				    &progs.progs[progs.nr_of_progs].func,
-				    false, -1, false);
+				    &progs.progs[progs.nr_of_progs].func, false,
+				    -1, false);
 	if (matches != 1)
 		progs.progs[progs.nr_of_progs].func = NULL;
 	progs.nr_of_progs++;
 
-	for (p = xdp_multiprog__next_prog(NULL, mp);
-	     p;
+	for (p = xdp_multiprog__next_prog(NULL, mp); p;
 	     p = xdp_multiprog__next_prog(p, mp)) {
-
 		progs.progs[progs.nr_of_progs].prog = p;
-		matches = find_func_matches(xdp_program__btf(p),
-					    xdp_program__name(p),
-					    &progs.progs[progs.nr_of_progs].func,
-					    false, -1, false);
+		matches = find_func_matches(
+			xdp_program__btf(p), xdp_program__name(p),
+			&progs.progs[progs.nr_of_progs].func, false, -1, false);
 		if (matches != 1)
 			progs.progs[progs.nr_of_progs].func = NULL;
 		progs.nr_of_progs++;
@@ -1066,23 +1363,21 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 	for (prog_name = strtok_r(program_names, ",", &prog_safe_ptr);
 	     prog_name != NULL;
 	     prog_name = strtok_r(NULL, ",", &prog_safe_ptr)) {
-
-		int   rc;
+		int rc;
 		unsigned long id = -1;
 		char *id_str = strchr(prog_name, '@');
 		char *alloc_name = NULL;
 
 		if (id_str) {
-			unsigned int  i;
-			char         *endptr;
+			unsigned int i;
+			char *endptr;
 
 			errno = 0;
 			id_str++;
 			id = strtoul(id_str, &endptr, 10);
-			if ((errno == ERANGE && id == ULONG_MAX)
-			    || (errno != 0 && id == 0) || *endptr != '\0'
-			    || endptr == id_str) {
-
+			if ((errno == ERANGE && id == ULONG_MAX) ||
+			    (errno != 0 && id == 0) || *endptr != '\0' ||
+			    endptr == id_str) {
 				pr_warn("ERROR: Can't extract valid program id from \"%s\"!\n",
 					prog_name);
 				if (cfg->program_names != program_names)
@@ -1102,8 +1397,7 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 				return -EINVAL;
 			}
 
-			alloc_name = strndup(prog_name,
-					     id_str - prog_name - 1);
+			alloc_name = strndup(prog_name, id_str - prog_name - 1);
 			if (!alloc_name) {
 				pr_warn("ERROR: Out of memory while processing program-name argument!\n");
 				if (cfg->program_names != program_names)
@@ -1120,13 +1414,16 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 			unsigned long prog_id;
 
 			prog_id = strtoul(prog_name, &endptr, 10);
-			if (!((errno == ERANGE && prog_id == ULONG_MAX)
-			      || (errno != 0 && prog_id == 0) || *endptr != '\0'
-			      || endptr == prog_name)) {
-
-				for (unsigned int i = 0; i < progs.nr_of_progs; i++) {
-					if (prog_id == xdp_program__id(progs.progs[i].prog)) {
-						alloc_name = strdup(progs.progs[i].func);
+			if (!((errno == ERANGE && prog_id == ULONG_MAX) ||
+			      (errno != 0 && prog_id == 0) || *endptr != '\0' ||
+			      endptr == prog_name)) {
+				for (unsigned int i = 0; i < progs.nr_of_progs;
+				     i++) {
+					if (prog_id ==
+					    xdp_program__id(
+						    progs.progs[i].prog)) {
+						alloc_name = strdup(
+							progs.progs[i].func);
 						if (alloc_name) {
 							id = prog_id;
 							prog_name = alloc_name;
@@ -1176,9 +1473,12 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
 		if (!progs.progs[i].rx_capture)
 			continue;
 
-		tgt_progs->progs[tgt_progs->nr_of_progs].prog = progs.progs[i].prog;
-		tgt_progs->progs[tgt_progs->nr_of_progs].func = progs.progs[i].func;
-		tgt_progs->progs[tgt_progs->nr_of_progs].rx_capture = progs.progs[i].rx_capture;
+		tgt_progs->progs[tgt_progs->nr_of_progs].prog =
+			progs.progs[i].prog;
+		tgt_progs->progs[tgt_progs->nr_of_progs].func =
+			progs.progs[i].func;
+		tgt_progs->progs[tgt_progs->nr_of_progs].rx_capture =
+			progs.progs[i].rx_capture;
 		tgt_progs->nr_of_progs++;
 	}
 	return 0;
@@ -1189,9 +1489,9 @@ static int find_target(struct dumpopt *cfg, struct xdp_multiprog *mp,
  *****************************************************************************/
 static char *get_loaded_program_info(struct dumpopt *cfg)
 {
-	char                *info;
-	size_t               info_size = 128;
-	size_t               info_offset = 0;
+	char *info;
+	size_t info_size = 128;
+	size_t info_offset = 0;
 	struct xdp_multiprog *mp = NULL;
 
 	info = malloc(info_size);
@@ -1206,8 +1506,8 @@ static char *get_loaded_program_info(struct dumpopt *cfg)
 
 	mp = xdp_multiprog__get_from_ifindex(cfg->iface.ifindex);
 	if (IS_ERR_OR_NULL(mp)) {
-		if (append_snprintf(&info, &info_size, &info_offset,
-				    "  %s()\n", "<No XDP program loaded!>"))
+		if (append_snprintf(&info, &info_size, &info_offset, "  %s()\n",
+				    "<No XDP program loaded!>"))
 			goto error_out;
 	} else {
 		struct xdp_program *prog = NULL;
@@ -1242,7 +1542,7 @@ static bool add_interfaces_to_pcapng(struct dumpopt *cfg,
 				     struct capture_programs *progs)
 {
 	uint64_t if_speed;
-	char     if_drv[260];
+	char if_drv[260];
 
 	if_speed = get_if_speed(&cfg->iface);
 	if_drv[0] = 0;
@@ -1258,12 +1558,9 @@ static bool add_interfaces_to_pcapng(struct dumpopt *cfg,
 			return false;
 		}
 
-		if (xpcapng_dump_add_interface(pcapng_dumper,
-					       cfg->snaplen,
-					       if_name, NULL, NULL,
-					       if_speed,
-					       9 /* nsec resolution */,
-					       if_drv) < 0) {
+		if (xpcapng_dump_add_interface(
+			    pcapng_dumper, cfg->snaplen, if_name, NULL, NULL,
+			    if_speed, 9 /* nsec resolution */, if_drv) < 0) {
 			pr_warn("ERROR: Can't add %s interface to PcapNG file!\n",
 				if_name);
 			return false;
@@ -1276,12 +1573,9 @@ static bool add_interfaces_to_pcapng(struct dumpopt *cfg,
 			return false;
 		}
 
-		if (xpcapng_dump_add_interface(pcapng_dumper,
-					       cfg->snaplen,
-					       if_name, NULL, NULL,
-					       if_speed,
-					       9 /* nsec resolution */,
-					       if_drv) < 0) {
+		if (xpcapng_dump_add_interface(
+			    pcapng_dumper, cfg->snaplen, if_name, NULL, NULL,
+			    if_speed, 9 /* nsec resolution */, if_drv) < 0) {
 			pr_warn("ERROR: Can't add %s interface to PcapNG file!\n",
 				if_name);
 			return false;
@@ -1294,10 +1588,12 @@ static void print_compat_error(const char *what)
 {
 #if defined(__x86_64__) || defined(__i686__)
 	pr_warn("ERROR: The kernel does not support "
-		"fentry %s because it is too old!", what);
+		"fentry %s because it is too old!",
+		what);
 #else
 	pr_warn("ERROR: The kernel does not support "
-		"fentry %s on the current CPU architecture!", what);
+		"fentry %s on the current CPU architecture!",
+		what);
 #endif
 }
 
@@ -1308,15 +1604,15 @@ static bool load_and_attach_trace(struct dumpopt *cfg,
 				  struct capture_programs *progs,
 				  unsigned int idx)
 {
-	int                          err;
-	struct bpf_object           *trace_obj = NULL;
-	struct bpf_program          *trace_prog_fentry;
-	struct bpf_program          *trace_prog_fexit;
-	struct bpf_link             *trace_link_fentry = NULL;
-	struct bpf_link             *trace_link_fexit = NULL;
-	struct bpf_map              *perf_map;
-	struct bpf_map              *data_map;
-	struct trace_configuration   trace_cfg;
+	int err;
+	struct bpf_object *trace_obj = NULL;
+	struct bpf_program *trace_prog_fentry;
+	struct bpf_program *trace_prog_fexit;
+	struct bpf_link *trace_link_fentry = NULL;
+	struct bpf_link *trace_link_fexit = NULL;
+	struct bpf_map *perf_map;
+	struct bpf_map *data_map;
+	struct trace_configuration trace_cfg;
 
 	if (idx >= progs->nr_of_progs || progs->nr_of_progs == 0) {
 		pr_warn("ERROR: Attach program ID invalid!\n");
@@ -1368,15 +1664,15 @@ rlimit_loop:
 	}
 
 	/* Locate the fentry and fexit functions */
-	trace_prog_fentry = bpf_object__find_program_by_name(trace_obj,
-							     "trace_on_entry");
+	trace_prog_fentry =
+		bpf_object__find_program_by_name(trace_obj, "trace_on_entry");
 	if (!trace_prog_fentry) {
 		pr_warn("ERROR: Can't find XDP trace fentry function!\n");
 		goto error_exit;
 	}
 
-	trace_prog_fexit = bpf_object__find_program_by_name(trace_obj,
-							    "trace_on_exit");
+	trace_prog_fexit =
+		bpf_object__find_program_by_name(trace_obj, "trace_on_exit");
 	if (!trace_prog_fexit) {
 		pr_warn("ERROR: Can't find XDP trace fexit function!\n");
 		goto error_exit;
@@ -1396,8 +1692,7 @@ rlimit_loop:
 				       progs->progs[idx].func);
 
 	/* Reuse the xdpdump_perf_map for all programs */
-	perf_map = bpf_object__find_map_by_name(trace_obj,
-						"xdpdump_perf_map");
+	perf_map = bpf_object__find_map_by_name(trace_obj, "xdpdump_perf_map");
 	if (!perf_map) {
 		pr_warn("ERROR: Can't find xdpdump_perf_map in trace program!\n");
 		goto error_exit;
@@ -1431,7 +1726,8 @@ rlimit_loop:
 
 	/* Attach trace programs only in the direction(s) needed */
 	if (progs->progs[idx].rx_capture & RX_FLAG_FENTRY) {
-		trace_link_fentry = bpf_program__attach_trace(trace_prog_fentry);
+		trace_link_fentry =
+			bpf_program__attach_trace(trace_prog_fentry);
 		err = libbpf_get_error(trace_link_fentry);
 		if (err) {
 			if (err == -ENOTSUPP)
@@ -1523,12 +1819,12 @@ static bool load_xdp_trace_program(struct dumpopt *cfg,
 				   struct capture_programs *progs)
 {
 	DECLARE_LIBXDP_OPTS(xdp_program_opts, opts, 0);
-	int                         fd, rc;
-	char                        errmsg[STRERR_BUFSIZE];
-	struct xdp_program         *prog;
-	struct bpf_map             *perf_map;
-	struct bpf_map             *data_map;
-	struct trace_configuration  trace_cfg;
+	int fd, rc;
+	char errmsg[STRERR_BUFSIZE];
+	struct xdp_program *prog;
+	struct bpf_map *perf_map;
+	struct bpf_map *data_map;
+	struct trace_configuration trace_cfg;
 
 	if (!cfg || !progs)
 		return false;
@@ -1544,8 +1840,8 @@ static bool load_xdp_trace_program(struct dumpopt *cfg,
 		int err = libxdp_get_error(prog);
 
 		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		pr_warn("ERROR: Can't open XDP trace program: %s(%d)\n",
-			errmsg, err);
+		pr_warn("ERROR: Can't open XDP trace program: %s(%d)\n", errmsg,
+			err);
 		return false;
 	}
 
@@ -1594,7 +1890,7 @@ static bool load_xdp_trace_program(struct dumpopt *cfg,
 	fd = bpf_map__fd(perf_map);
 	if (fd < 0) {
 		pr_warn("ERROR: Can't get xdpdump_perf_map file descriptor: %s\n",
-			strerror(errno));
+			strerror(fd));
 
 		xdp_program__detach(prog, cfg->iface.ifindex,
 				    cfg->load_xdp_mode, 0);
@@ -1636,28 +1932,32 @@ static void unload_xdp_trace_program(struct dumpopt *cfg,
  *****************************************************************************/
 static bool capture_on_interface(struct dumpopt *cfg)
 {
-	int                          err, cnt;
-	bool                         rc = false;
-	bool                         load_xdp = false;
-	bool                         promiscuous = false;
-	pcap_t                      *pcap = NULL;
-	pcap_dumper_t               *pcap_dumper = NULL;
-	struct xpcapng_dumper       *pcapng_dumper = NULL;
-	struct perf_buffer          *perf_buf = NULL;
-	struct perf_event_attr       perf_attr = {
+	int err, cnt;
+	bool rc = false;
+	bool load_xdp = false;
+	bool promiscuous = false;
+	pcap_t *pcap = NULL;
+	pcap_dumper_t *pcap_dumper = NULL;
+	struct xpcapng_dumper *pcapng_dumper = NULL;
+	struct perf_buffer *perf_buf = NULL;
+	struct perf_event_attr perf_attr = {
 		.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_TIME,
 		.type = PERF_TYPE_SOFTWARE,
 		.config = PERF_COUNT_SW_BPF_OUTPUT,
 		.sample_period = 1,
 		.wakeup_events = 1,
 	};
-	struct perf_handler_ctx      perf_ctx;
-	struct xdp_multiprog         *mp;
-	struct capture_programs      tgt_progs = {};
+
+	struct perf_handler_ctx perf_ctx;
+	struct xdp_multiprog *mp;
+	struct capture_programs tgt_progs = {};
+	// printf("%d", ni);
+	// if (ni == 2)
+	// 	cfg->iface = cfg->iface2;
 
 	mp = xdp_multiprog__get_from_ifindex(cfg->iface.ifindex);
-	if (IS_ERR_OR_NULL(mp) || xdp_multiprog__main_prog(mp) == NULL) {
 
+	if (IS_ERR_OR_NULL(mp) || xdp_multiprog__main_prog(mp) == NULL) {
 		if (!cfg->load_xdp) {
 			pr_warn("WARNING: Specified interface does not have an XDP program loaded%s,"
 				"\n         capturing in legacy mode!\n",
@@ -1671,7 +1971,17 @@ static bool capture_on_interface(struct dumpopt *cfg)
 			IS_ERR_OR_NULL(mp) ? "" : " in software");
 		load_xdp = true;
 	}
+	// int number_of_seconds = 100;
+	// int milli_seconds = 1000 * number_of_seconds;
 
+	// Storing start time
+	// clock_t start_time = clock();
+
+	// looping till required time is not achieved
+	// while (clock() < start_time + milli_seconds) {
+	// 	printf("Hello from process: %d\n", omp_get_thread_num());
+	// };
+	// goto error_exit;
 	if (!load_xdp) {
 		if (find_target(cfg, mp, &tgt_progs))
 			goto error_exit;
@@ -1707,9 +2017,8 @@ static bool capture_on_interface(struct dumpopt *cfg)
 		}
 	}
 
-        /* Open the pcap handle */
+	/* Open the pcap handle */
 	if (cfg->pcap_file) {
-
 		if (cfg->use_pcap) {
 			pcap = pcap_open_dead(DLT_EN10MB, cfg->snaplen);
 			if (!pcap) {
@@ -1723,17 +2032,18 @@ static bool capture_on_interface(struct dumpopt *cfg)
 				goto error_exit;
 			}
 		} else {
-			char           *program_info;
-			struct utsname  utinfo;
-			char            os_info[260];
+			char *program_info;
+			struct utsname utinfo;
+			char os_info[260];
 
 			memset(&utinfo, 0, sizeof(utinfo));
 			uname(&utinfo);
 
 			os_info[0] = 0;
-			if (try_snprintf(os_info, sizeof(os_info), "%s %s %s %s",
-					 utinfo.sysname, utinfo.nodename,
-					 utinfo.release, utinfo.version)) {
+			if (try_snprintf(os_info, sizeof(os_info),
+					 "%s %s %s %s", utinfo.sysname,
+					 utinfo.nodename, utinfo.release,
+					 utinfo.version)) {
 				pr_warn("ERROR: Could not format OS information!\n");
 				goto error_exit;
 			}
@@ -1744,11 +2054,9 @@ static bool capture_on_interface(struct dumpopt *cfg)
 				goto error_exit;
 			}
 
-			pcapng_dumper = xpcapng_dump_open(cfg->pcap_file,
-							  program_info,
-							  utinfo.machine,
-							  os_info,
-							  "xdpdump v" TOOLS_VERSION);
+			pcapng_dumper = xpcapng_dump_open(
+				cfg->pcap_file, program_info, utinfo.machine,
+				os_info, "xdpdump v" TOOLS_VERSION);
 
 			free(program_info);
 			if (!pcapng_dumper) {
@@ -1756,9 +2064,8 @@ static bool capture_on_interface(struct dumpopt *cfg)
 				goto error_exit;
 			}
 
-
 			if (!add_interfaces_to_pcapng(cfg, pcapng_dumper,
-						     &tgt_progs)) {
+						      &tgt_progs)) {
 				/* Error output is handled in
 				 * add_interfaces_to_pcapng()
 				 */
@@ -1782,15 +2089,14 @@ static bool capture_on_interface(struct dumpopt *cfg)
 
 	/* Setup perf context */
 	memset(&perf_ctx, 0, sizeof(perf_ctx));
+	// perf_ctx.output_file = file;
 	perf_ctx.cfg = cfg;
 	perf_ctx.xdp_progs = &tgt_progs;
 	perf_ctx.pcap = pcap;
 	perf_ctx.pcap_dumper = pcap_dumper;
 	perf_ctx.pcapng_dumper = pcapng_dumper;
-
-	if (get_epoch_to_uptime_delta(&perf_ctx.epoch_delta))
-		goto error_exit;
-
+	// perf_ctx.epoch_delta = get_epoch_to_uptime_delta();
+	perf_ctx.epoch_delta = 0;
 	/* Determine the perf wakeup_events value to use */
 #ifdef HAVE_LIBBPF_PERF_BUFFER__CONSUME
 	if (cfg->pcap_file) {
@@ -1806,11 +2112,12 @@ static bool capture_on_interface(struct dumpopt *cfg)
 			 * fill without losing any packets.
 			 */
 			uint32_t events = PERF_MMAP_PAGE_COUNT * getpagesize() /
-				(libbpf_num_possible_cpus() ?: 1) / 2048;
+					  (libbpf_num_possible_cpus() ?: 1) /
+					  2048;
 
 			if (events > 0)
-				perf_attr.wakeup_events = min(PERF_MAX_WAKEUP_EVENTS,
-							      events);
+				perf_attr.wakeup_events =
+					min(PERF_MAX_WAKEUP_EVENTS, events);
 		}
 	} else {
 		/* Only buffer in perf ring when using pcap_file */
@@ -1825,19 +2132,17 @@ static bool capture_on_interface(struct dumpopt *cfg)
 #ifdef HAVE_LIBBPF_PERF_BUFFER__NEW_RAW
 	/* the configure check looks for the 6-argument variant of the function */
 	perf_buf = perf_buffer__new_raw(tgt_progs.progs[0].perf_map_fd,
-					PERF_MMAP_PAGE_COUNT,
-					&perf_attr, handle_perf_event,
-					&perf_ctx, NULL);
+					PERF_MMAP_PAGE_COUNT, &perf_attr,
+					handle_perf_event, &perf_ctx, NULL);
 #else
-	struct perf_buffer_raw_opts  perf_opts = {};
+	struct perf_buffer_raw_opts perf_opts = {};
 
 	/* Setup perf ring buffers */
 	perf_opts.attr = &perf_attr;
-	perf_opts.event_cb = handle_perf_event;
+	// perf_opts.event_cb = handle_perf_event;
 	perf_opts.ctx = &perf_ctx;
 	perf_buf = perf_buffer__new_raw(tgt_progs.progs[0].perf_map_fd,
-					PERF_MMAP_PAGE_COUNT,
-					&perf_opts);
+					PERF_MMAP_PAGE_COUNT, &perf_opts);
 #endif
 
 	if (perf_buf == NULL) {
@@ -1847,6 +2152,7 @@ static bool capture_on_interface(struct dumpopt *cfg)
 	}
 
 	/* Loop trough the dumper */
+	start_capture[cfg->iface.ifindex] = omp_get_wtime();
 	while (!exit_xdpdump) {
 		cnt = perf_buffer__poll(perf_buf, 1000);
 		if (cnt < 0 && errno != EINTR) {
@@ -1855,16 +2161,25 @@ static bool capture_on_interface(struct dumpopt *cfg)
 			goto error_exit;
 		}
 	}
+	end_capture[cfg->iface.ifindex] = omp_get_wtime();
+
 #ifdef HAVE_LIBBPF_PERF_BUFFER__CONSUME
 	perf_buffer__consume(perf_buf);
 #endif
 
-	fprintf(stderr, "\n%"PRIu64" packets captured\n",
+#pragma omp critical(result)
+{
+	fprintf(stderr, "\n%" PRIu64 " packets captured\n",
 		perf_ctx.captured_packets);
-	fprintf(stderr, "%"PRIu64" packets dropped by perf ring\n",
-		perf_ctx.missed_events);
-
-
+	fprintf(stderr, "%" PRIu64 " packets dropped by perf ring here, %s\n",
+		perf_ctx.missed_events, cfg->iface.ifname);
+	fprintf(stderr, "Start time : %f \n",
+		start_capture[cfg->iface.ifindex]);
+	fprintf(stderr, "End time : %f \n", end_capture[cfg->iface.ifindex]);
+	fprintf(stderr, "Duration : %f second \n",
+		end_capture[cfg->iface.ifindex] -
+			start_capture[cfg->iface.ifindex]);
+}
 	rc = true;
 
 error_exit:
@@ -1873,7 +2188,8 @@ error_exit:
 		err = set_if_promiscuous_mode(&cfg->iface, false, NULL);
 		if (err)
 			pr_warn("ERROR: Failed disabling promiscuous mode: "
-				"%s(%d)\n", strerror(-err), -err);
+				"%s(%d)\n",
+				strerror(-err), -err);
 	}
 
 	perf_buffer__free(perf_buf);
@@ -1904,14 +2220,1006 @@ static void signal_handler(__unused int signo)
 		pcap_breakloop(exit_pcap);
 }
 
+void get_process_info(pid_t pid, double time_h, double throughput)
+{
+	char command[100];
+	snprintf(
+		command, sizeof(command),
+		"ps -p %d -o pid,%%cpu,tid,vsz -T | sed -n '2p;3p' | paste -sd ';' | sed 's/ /;/g'",
+		pid); // Prepare the command
+
+	FILE *fp;
+	char buffer[256];
+
+	// Open the command for reading
+	fp = popen(command, "r");
+	if (fp == NULL) {
+		perror("popen failed");
+		return;
+	}
+
+	// Read the output line by line
+	while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+		printf("%f;%f;%s", time_h, throughput,
+		       buffer); // Print the output
+	}
+
+	// Close the pipe
+	if (pclose(fp) == -1) {
+		perror("pclose failed");
+	}
+}
+
+float network_byte_order_to_float(uint32_t value)
+{
+	// Convert from network byte order to host byte order
+	uint32_t temp = ntohl(value);
+	// Reinterpret the integer as a float
+	float result;
+	memcpy(&result, &temp, sizeof(result)); // Copy bits back into float
+	return result;
+}
+
+void convert_flow()
+{
+	// while (!exit_xdpdump) {
+	// 	struct flow_tuple flow;
+	// 	memset(&flow, 0, sizeof(flow));
+	// }
+
+	while (!exit_xdpdump) {
+		// #pragma omp critical (flow)
+		{
+			int prediction;
+			struct flow_tuple flow;
+			memset(&flow, 0, sizeof(flow));
+// if (isNew) {
+#pragma omp critical(convertflow)
+			for (int i = 0; i < size; i++) {
+				flow.src_ip = buff__table[i].src_ip.s_addr;
+				flow.dst_ip = buff__table[i].dst_ip.s_addr;
+				flow.protocol = IPPROTO_TCP;
+				flow.src_ip = buff__table[i].src_port;
+				flow.dst_ip = buff__table[i].dst_port;
+				unsigned int index = hash_flow(&flow);
+				if (flow_table[index] == NULL) {
+					total_flow++;
+					flow_table[index] = (struct flow_info *)
+						malloc(sizeof(
+							struct flow_info));
+					memset(flow_table[index], 0,
+					       sizeof(struct flow_info));
+
+					if (flow_table[index] == NULL) {
+						perror("Failed to allocate memory");
+						exit(EXIT_FAILURE);
+					} else {
+						struct flow_info *flow_entry =
+							flow_table[index];
+						flow_entry->start_time =
+							buff__table[i].timestamp;
+					}
+				}
+
+				//
+				{
+					struct flow_info *flow_entry =
+						flow_table[index];
+
+					// int fwd_data_pkts_tot = 0;
+					double end_time_temp =
+						buff__table[i].timestamp;
+					double iat = end_time_temp -
+						     flow_entry->end_time;
+
+					flow_entry->end_time = end_time_temp;
+
+					float flow_duration;
+
+					flow_duration = flow_entry->end_time -
+							flow_entry->start_time;
+					flag = tcp->th_flags;
+
+					int payload_size =
+						buff__table[i].payload_size -
+						(size_ip + size_tcp);
+					flow_entry->total_payload +=
+						payload_size;
+
+					int header_size;
+					header_size = SIZE_ETHERNET + size_ip +
+						      size_tcp;
+
+					flow_entry->ssquare_iat +=
+						(double)(iat * iat);
+
+					// forward
+					if (buff__table[i].direction) {
+						// update bulk (ported from CICFLowmeter)
+						if (flow_entry
+							    ->backward_bulk_last_timestamp >
+						    flow_entry
+							    ->forward_bulk_start_tmp)
+							flow_entry
+								->forward_bulk_start_tmp =
+								0;
+
+						if (flow_entry
+							    ->forward_bulk_start_tmp ==
+						    0) {
+							flow_entry
+								->forward_bulk_start_tmp =
+								buff__table[i]
+									.timestamp;
+							flow_entry
+								->forward_bulk_last_timestamp =
+								buff__table[i]
+									.timestamp;
+							flow_entry
+								->forward_bulk_count_tmp =
+								1;
+							flow_entry
+								->forward_bulk_size_tmp =
+								buff__table[i]
+									.payload_size;
+						} else {
+							if ((buff__table[i]
+								     .timestamp -
+							     flow_entry
+								     ->forward_bulk_last_timestamp) >
+							    CLUMP_TIMEOUT) {
+								flow_entry
+									->forward_bulk_start_tmp =
+									buff__table[i]
+										.timestamp;
+								flow_entry
+									->forward_bulk_last_timestamp =
+									buff__table[i]
+										.timestamp;
+								flow_entry
+									->forward_bulk_count_tmp =
+									1;
+								flow_entry
+									->forward_bulk_size_tmp =
+									buff__table[i]
+										.payload_size;
+							} else {
+								// add bulk
+								flow_entry
+									->forward_bulk_count_tmp++;
+								flow_entry
+									->forward_bulk_size_tmp +=
+									buff__table[i]
+										.payload_size;
+								if (flow_entry
+									    ->forward_bulk_count_tmp ==
+								    BULK_BOUND) {
+									flow_entry
+										->forward_bulk_count++;
+									flow_entry
+										->forward_bulk_packet_count +=
+										flow_entry
+											->forward_bulk_count_tmp;
+									flow_entry
+										->forward_bulk_size +=
+										flow_entry
+											->forward_bulk_size_tmp;
+									flow_entry
+										->forward_bulk_duration +=
+										(buff__table[i]
+											 .timestamp -
+										 flow_entry
+											 ->forward_bulk_start_tmp);
+
+								} else if (
+									flow_entry
+										->forward_bulk_count_tmp >
+									BULK_BOUND) {
+									flow_entry
+										->forward_bulk_packet_count +=
+										1;
+									flow_entry
+										->forward_bulk_size +=
+										payload_size;
+									flow_entry
+										->forward_bulk_duration +=
+										(buff__table[i]
+											 .timestamp -
+										 flow_entry
+											 ->forward_bulk_last_timestamp);
+								}
+								flow_entry
+									->forward_bulk_last_timestamp =
+									buff__table[i]
+										.timestamp;
+							}
+						}
+
+						// end of update bulk
+						flow_entry->fwd_pkts_tot += 1;
+						flow_entry->fwd_data_pkts_tot +=
+							payload_size;
+						flow_entry
+							->fwd_header_size_tot +=
+							header_size;
+						flow_entry
+							->fwd_ssquare_payload +=
+							(double)(payload_size *
+								 payload_size);
+						flow_entry->fwd_ssquare_iat +=
+							(double)(iat * iat);
+
+						if (flag & 0x08)
+							flow_entry
+								->fwd_PSH_flag_count +=
+								1;
+						if (flag & 0x20)
+							flow_entry
+								->fwd_URG_flag_count +=
+								1;
+
+						if (flow_entry
+							    ->fwd_pkts_payload_min ==
+						    0)
+							flow_entry
+								->fwd_pkts_payload_min =
+								payload_size;
+						else {
+							if (payload_size <
+							    flow_entry
+								    ->fwd_pkts_payload_min)
+								flow_entry
+									->fwd_pkts_payload_min =
+									payload_size;
+						}
+
+						if (flow_entry
+							    ->fwd_pkts_payload_max ==
+						    0)
+							flow_entry
+								->fwd_pkts_payload_max =
+								payload_size;
+						else {
+							if (payload_size >
+							    flow_entry
+								    ->fwd_pkts_payload_max)
+								flow_entry
+									->fwd_pkts_payload_max =
+									payload_size;
+						}
+
+						flow_entry
+							->fwd_pkts_payload_tot +=
+							payload_size;
+						flow_entry
+							->fwd_pkts_payload_count +=
+							1;
+						flow_entry
+							->fwd_pkts_payload_avg =
+							(double)flow_entry
+								->fwd_pkts_payload_tot /
+							(double)flow_entry
+								->fwd_pkts_payload_count;
+
+						double variance =
+							(flow_entry
+								 ->fwd_ssquare_payload /
+							 flow_entry
+								 ->fwd_pkts_payload_count) -
+							(flow_entry
+								 ->fwd_pkts_payload_avg *
+							 flow_entry
+								 ->fwd_pkts_payload_avg);
+						flow_entry
+							->fwd_pkts_payload_std =
+							sqrt(variance);
+						if (isnan(flow_entry
+								  ->fwd_pkts_payload_std))
+							flow_entry
+								->fwd_pkts_payload_std =
+								0;
+
+						if (flow_entry
+							    ->fwd_header_size_min ==
+						    0) {
+							flow_entry
+								->fwd_header_size_min =
+								header_size;
+						} else {
+							if (header_size <
+							    flow_entry
+								    ->fwd_header_size_min)
+								flow_entry
+									->fwd_header_size_min =
+									header_size;
+						}
+
+						if (flow_entry
+							    ->fwd_header_size_max ==
+						    0) {
+							flow_entry
+								->fwd_header_size_max =
+								header_size;
+						} else {
+							if (header_size >
+							    flow_entry
+								    ->fwd_header_size_max)
+								flow_entry
+									->fwd_header_size_max =
+									header_size;
+						}
+
+						if (flow_entry->fwd_iat_min ==
+						    0)
+							flow_entry->fwd_iat_min =
+								iat;
+						else {
+							if (iat <
+							    flow_entry
+								    ->fwd_iat_min)
+								flow_entry
+									->fwd_iat_min =
+									iat;
+						}
+
+						if (flow_entry->fwd_iat_max ==
+						    0)
+							flow_entry->fwd_iat_max =
+								iat;
+						else {
+							if (iat >
+							    flow_entry
+								    ->fwd_iat_max)
+								flow_entry
+									->fwd_iat_max =
+									iat;
+						}
+
+						flow_entry->fwd_iat_tot += iat;
+						flow_entry->fwd_iat_count += 1;
+						flow_entry->fwd_iat_avg =
+							(double)(flow_entry
+									 ->fwd_iat_tot /
+								 flow_entry
+									 ->fwd_iat_count);
+						double variance_iat =
+							(flow_entry
+								 ->fwd_ssquare_iat /
+							 flow_entry
+								 ->fwd_iat_count) -
+							(flow_entry->fwd_iat_avg *
+							 flow_entry
+								 ->fwd_iat_avg);
+						flow_entry->fwd_iat_std =
+							sqrt(variance_iat);
+						if (isnan(flow_entry
+								  ->fwd_iat_std))
+							flow_entry->fwd_iat_std =
+								0;
+					} else {
+						//backward packets
+
+						//bulk packets
+						if (flow_entry
+							    ->forward_bulk_last_timestamp >
+						    flow_entry
+							    ->backward_bulk_last_timestamp)
+							flow_entry
+								->backward_bulk_start_tmp =
+								0;
+						if (flow_entry
+							    ->backward_bulk_start_tmp ==
+						    0) {
+							flow_entry
+								->backward_bulk_start_tmp =
+								buff__table[i]
+									.timestamp;
+							flow_entry
+								->backward_bulk_last_timestamp =
+								buff__table[i]
+									.timestamp;
+							flow_entry
+								->backward_bulk_count_tmp =
+								1;
+							flow_entry
+								->backward_bulk_size_tmp =
+								buff__table[i]
+									.payload_size;
+						} else {
+							if ((buff__table[i]
+								     .timestamp -
+							     flow_entry
+								     ->backward_bulk_last_timestamp) >
+							    CLUMP_TIMEOUT) {
+								flow_entry
+									->backward_bulk_start_tmp =
+									buff__table[i]
+										.timestamp;
+								flow_entry
+									->backward_bulk_last_timestamp =
+									buff__table[i]
+										.timestamp;
+								flow_entry
+									->backward_bulk_count_tmp =
+									1;
+								flow_entry
+									->backward_bulk_size_tmp =
+									buff__table[i]
+										.payload_size;
+							} else {
+								flow_entry
+									->backward_bulk_count_tmp++;
+								flow_entry
+									->backward_bulk_size_tmp +=
+									buff__table[i]
+										.payload_size;
+								if (flow_entry
+									    ->backward_bulk_count_tmp ==
+								    BULK_BOUND) {
+									flow_entry
+										->backward_bulk_count++;
+									flow_entry
+										->backward_bulk_packet_count +=
+										flow_entry
+											->backward_bulk_count_tmp;
+									flow_entry
+										->backward_bulk_size +=
+										flow_entry
+											->backward_bulk_size_tmp;
+									flow_entry
+										->backward_bulk_duration +=
+										(buff__table[i]
+											 .timestamp -
+										 flow_entry
+											 ->backward_bulk_start_tmp);
+								} else if (
+									flow_entry
+										->backward_bulk_count_tmp >
+									BULK_BOUND) {
+									flow_entry
+										->backward_bulk_packet_count++;
+									flow_entry
+										->backward_bulk_size +=
+										buff__table[i]
+											.payload_size;
+									flow_entry
+										->backward_bulk_duration +=
+										(buff__table[i]
+											 .timestamp -
+										 flow_entry
+											 ->backward_bulk_last_timestamp);
+								}
+								flow_entry
+									->backward_bulk_last_timestamp =
+									buff__table[i]
+										.timestamp;
+							}
+						}
+						//end of bulk packets
+
+						flow_entry->bwd_pkts_tot += 1;
+						flow_entry
+							->bwd_header_size_tot +=
+							header_size;
+						flow_entry->bwd_data_pkts_tot +=
+							payload_size;
+						flow_entry
+							->bwd_ssquare_payload +=
+							(double)(payload_size *
+								 payload_size);
+						flow_entry->bwd_ssquare_iat +=
+							(double)(iat * iat);
+
+						if (flag & 0x20)
+							flow_entry
+								->bwd_URG_flag_count +=
+								1;
+						if (flag & 0x08)
+							flow_entry
+								->bwd_PSH_flag_count +=
+								1;
+
+						if (flow_entry
+							    ->bwd_header_size_min ==
+						    0) {
+							flow_entry
+								->bwd_header_size_min =
+								header_size;
+						} else {
+							if (header_size <
+							    flow_entry
+								    ->bwd_header_size_min)
+								flow_entry
+									->bwd_header_size_min =
+									header_size;
+						}
+
+						if (flow_entry
+							    ->bwd_header_size_max ==
+						    0) {
+							flow_entry
+								->bwd_header_size_max =
+								header_size;
+						} else {
+							if (header_size >
+							    flow_entry
+								    ->bwd_header_size_max)
+								flow_entry
+									->bwd_header_size_min =
+									header_size;
+						}
+
+						if (flow_entry
+							    ->bwd_pkts_payload_max ==
+						    0)
+							flow_entry
+								->bwd_pkts_payload_max =
+								payload_size;
+						else {
+							if (payload_size >
+							    flow_entry
+								    ->bwd_pkts_payload_max)
+								flow_entry
+									->bwd_pkts_payload_max =
+									payload_size;
+						}
+
+						flow_entry
+							->bwd_pkts_payload_tot +=
+							payload_size;
+						flow_entry
+							->bwd_pkts_payload_count +=
+							1;
+						flow_entry
+							->bwd_pkts_payload_avg =
+							(double)flow_entry
+								->bwd_pkts_payload_tot /
+							(double)flow_entry
+								->bwd_pkts_payload_count;
+
+						double variance =
+							(flow_entry
+								 ->bwd_ssquare_payload /
+							 flow_entry
+								 ->bwd_pkts_payload_count) -
+							(flow_entry
+								 ->bwd_pkts_payload_avg *
+							 flow_entry
+								 ->bwd_pkts_payload_avg);
+						flow_entry
+							->bwd_pkts_payload_std =
+							sqrt(variance);
+						if (isnan(flow_entry
+								  ->bwd_pkts_payload_std))
+							flow_entry
+								->bwd_pkts_payload_std =
+								0;
+
+						flow_entry->bwd_iat_tot += iat;
+						flow_entry->bwd_iat_count += 1;
+						flow_entry->bwd_iat_avg =
+							(double)(flow_entry
+									 ->bwd_iat_tot /
+								 flow_entry
+									 ->bwd_iat_count);
+						double variance_iat =
+							(flow_entry
+								 ->bwd_ssquare_iat /
+							 flow_entry
+								 ->bwd_iat_count) -
+							(flow_entry->bwd_iat_avg *
+							 flow_entry
+								 ->bwd_iat_avg);
+						flow_entry->bwd_iat_std =
+							sqrt(variance_iat);
+						if (isnan(flow_entry
+								  ->bwd_iat_std))
+							flow_entry->bwd_iat_std =
+								0;
+					}
+
+					if (flow_entry->flow_iat_min == 0)
+						flow_entry->flow_iat_min = iat;
+					else {
+						if (iat <
+						    flow_entry->flow_iat_min)
+							flow_entry
+								->flow_iat_min =
+								iat;
+					}
+
+					if (flow_entry->flow_iat_max == 0)
+						flow_entry->flow_iat_max = iat;
+					else {
+						if (iat >
+						    flow_entry->flow_iat_max)
+							flow_entry
+								->flow_iat_max =
+								iat;
+					}
+					flow_entry->flow_iat_tot += iat;
+					flow_entry->flow_iat_count += 1;
+					flow_entry->flow_iat_avg =
+						(double)(flow_entry
+								 ->flow_iat_tot /
+							 flow_entry
+								 ->flow_iat_count);
+					double variance_iat =
+						(flow_entry->ssquare_iat /
+						 flow_entry->flow_iat_count) -
+						(flow_entry->flow_iat_avg *
+						 flow_entry->flow_iat_avg);
+					flow_entry->flow_iat_std =
+						sqrt(variance_iat);
+					if (isnan(flow_entry->flow_iat_std))
+						flow_entry->flow_iat_std = 0;
+
+					if (flow_entry->flow_pkts_payload_min ==
+					    0)
+						flow_entry
+							->flow_pkts_payload_min =
+							payload_size;
+					else {
+						if (payload_size <
+						    flow_entry
+							    ->flow_pkts_payload_min)
+							flow_entry
+								->flow_pkts_payload_min =
+								payload_size;
+					}
+
+					if (flow_entry->flow_pkts_payload_max ==
+					    0)
+						flow_entry
+							->flow_pkts_payload_max =
+							payload_size;
+					else {
+						if (payload_size >
+						    flow_entry
+							    ->flow_pkts_payload_max)
+							flow_entry
+								->flow_pkts_payload_max =
+								payload_size;
+					}
+
+					flow_entry->flow_pkts_payload_tot +=
+						payload_size;
+					flow_entry->flow_pkts_payload_count +=
+						1;
+					flow_entry->flow_pkts_payload_avg =
+						(double)flow_entry
+							->flow_pkts_payload_tot /
+						(double)flow_entry
+							->flow_pkts_payload_count;
+
+					flow_entry->ssquare_payload +=
+						(double)(payload_size *
+							 payload_size);
+					double variance =
+						(flow_entry->ssquare_payload /
+						 flow_entry
+							 ->flow_pkts_payload_count) -
+						(flow_entry
+							 ->flow_pkts_payload_avg *
+						 flow_entry
+							 ->flow_pkts_payload_avg);
+					flow_entry->flow_pkts_payload_std =
+						sqrt(variance);
+					if (isnan(flow_entry
+							  ->flow_pkts_payload_std))
+						flow_entry
+							->flow_pkts_payload_std =
+							0;
+
+					double payload_bytes_per_second =
+						flow_entry->total_payload /
+						(flow_entry->end_time -
+						 flow_entry->start_time);
+
+					// int bwd_data_pkts_tot = 0;
+
+					int fwd_subflow_pkts =
+						flow_entry->fwd_pkts_tot;
+					int bwd_subflow_pkts =
+						flow_entry->bwd_pkts_tot;
+					double fwd_subflow_bytes =
+						flow_entry->fwd_pkts_payload_tot;
+					double bwd_subflow_bytes =
+						flow_entry->bwd_pkts_payload_tot;
+					double fwd_bulk_bytes =
+						flow_entry->forward_bulk_size;
+					double bwd_bulk_bytes =
+						flow_entry->backward_bulk_size;
+					int fwd_bulk_packets =
+						flow_entry
+							->forward_bulk_packet_count;
+					int bwd_bulk_packets =
+						flow_entry
+							->backward_bulk_packet_count;
+					double fwd_bulk_rate =
+						flow_entry->forward_bulk_size /
+						flow_entry
+							->forward_bulk_duration;
+					double bwd_bulk_rate =
+						flow_entry->backward_bulk_size /
+						flow_entry
+							->backward_bulk_duration;
+
+					flow_entry->active_min = 0;
+					flow_entry->active_max = 0;
+					flow_entry->active_tot = 0;
+					flow_entry->active_std = 0;
+
+					int idle_min = 0;
+					int idle_tot = 0;
+					int idle_avg = 0;
+					int fwd_init_window_size = 0;
+					int bwd_init_window_size = 0;
+					int fwd_last_window_size = 0;
+					int bwd_last_window_size = 0;
+					int idle_max = 0;
+					int idle_std = 0;
+					flow_entry->fwd_pkts_per_sec =
+						flow_entry->fwd_pkts_tot /
+						flow_duration;
+
+					flow_entry->bwd_pkts_per_sec =
+						flow_entry->bwd_pkts_tot /
+						flow_duration;
+
+					float flow_pkts_per_sec;
+					flow_pkts_per_sec =
+						flow_entry->fwd_pkts_per_sec +
+						flow_entry->bwd_pkts_per_sec;
+
+					float down_up_ratio;
+					if (flow_entry->bwd_pkts_tot > 0)
+						down_up_ratio =
+							(float)flow_entry
+								->fwd_pkts_tot /
+							(float)flow_entry
+								->bwd_pkts_tot;
+					else
+						down_up_ratio = 0;
+
+					if (buff__table[i].flag & 0x01)
+						flow_entry
+							->flow_FIN_flag_count +=
+							1;
+
+					if (buff__table[i].flag & 0x02)
+						flow_entry
+							->flow_SYN_flag_count +=
+							1;
+
+					if (buff__table[i].flag & 0x04)
+						flow_entry
+							->flow_RST_flag_count +=
+							1;
+
+					if (buff__table[i].flag & 0x10)
+						flow_entry
+							->flow_ACK_flag_count +=
+							1;
+
+					if (buff__table[i].flag & 0x80)
+						flow_entry
+							->flow_CWR_flag_count +=
+							1;
+
+					if (buff__table[i].flag & 0x40)
+						flow_entry
+							->flow_ECE_flag_count +=
+							1;
+
+					float input_data_from_function[NUM_FEATURES +
+								       3] = {
+						buff__table[i].src_port,
+						flow_duration,
+						flow_entry->fwd_pkts_tot,
+						flow_entry->bwd_pkts_tot,
+						flow_entry->fwd_data_pkts_tot,
+						flow_entry->bwd_data_pkts_tot,
+						flow_entry->fwd_pkts_per_sec,
+						flow_entry->bwd_pkts_per_sec,
+						flow_pkts_per_sec,
+						down_up_ratio,
+
+						flow_entry->fwd_header_size_tot,
+						flow_entry->fwd_header_size_min,
+						flow_entry->fwd_header_size_max,
+						flow_entry->bwd_header_size_tot,
+						flow_entry->bwd_header_size_min,
+						flow_entry->bwd_header_size_max,
+						flow_entry->flow_FIN_flag_count,
+						flow_entry->flow_SYN_flag_count,
+						flow_entry->flow_RST_flag_count,
+						flow_entry->fwd_PSH_flag_count,
+
+						flow_entry->bwd_PSH_flag_count,
+						flow_entry->flow_ACK_flag_count,
+						flow_entry->fwd_URG_flag_count,
+						flow_entry->bwd_URG_flag_count,
+						flow_entry->flow_CWR_flag_count,
+						flow_entry->flow_ECE_flag_count,
+						flow_entry->fwd_pkts_payload_min,
+						flow_entry->fwd_pkts_payload_max,
+						flow_entry->fwd_pkts_payload_tot,
+						flow_entry->fwd_pkts_payload_avg,
+
+						flow_entry->fwd_pkts_payload_std,
+						flow_entry->bwd_pkts_payload_min,
+						flow_entry->bwd_pkts_payload_max,
+						flow_entry->bwd_pkts_payload_tot,
+						flow_entry->bwd_pkts_payload_avg,
+						flow_entry->bwd_pkts_payload_std,
+						flow_entry
+							->flow_pkts_payload_min,
+						flow_entry
+							->flow_pkts_payload_max,
+						flow_entry
+							->flow_pkts_payload_tot,
+						flow_entry
+							->flow_pkts_payload_avg,
+
+						flow_entry
+							->flow_pkts_payload_std,
+						flow_entry->fwd_iat_min,
+						flow_entry->fwd_iat_max,
+						flow_entry->fwd_iat_tot,
+						flow_entry->fwd_iat_avg,
+						flow_entry->fwd_iat_std,
+						flow_entry->bwd_iat_min,
+						flow_entry->bwd_iat_max,
+						flow_entry->bwd_iat_tot,
+						flow_entry->bwd_iat_avg,
+
+						flow_entry->bwd_iat_std,
+						flow_entry->flow_iat_min,
+						flow_entry->flow_iat_max,
+						flow_entry->flow_iat_tot,
+						flow_entry->flow_iat_avg,
+						flow_entry->flow_iat_std,
+						payload_bytes_per_second,
+						fwd_subflow_pkts,
+						bwd_subflow_pkts,
+						fwd_subflow_bytes,
+
+						bwd_subflow_bytes, //disini 60
+						fwd_bulk_bytes, bwd_bulk_bytes,
+						fwd_bulk_packets,
+						bwd_bulk_packets, fwd_bulk_rate,
+						bwd_bulk_rate,
+						flow_entry->active_min,
+						flow_entry->active_max,
+						flow_entry->active_tot,
+
+						flow_entry->active_avg, //70
+						flow_entry->active_std,
+						idle_min, idle_max, idle_tot,
+						idle_avg, idle_std,
+						fwd_init_window_size,
+						bwd_init_window_size,
+						fwd_last_window_size,
+
+						bwd_last_window_size, 
+						network_byte_order_to_float(
+							buff__table[i]
+								.src_ip.s_addr),
+						network_byte_order_to_float(
+							buff__table[i]
+								.dst_ip.s_addr),
+						buff__table[i].dst_port
+					};
+					size = 0;
+#pragma omp critical(predict)
+					{
+						if (size_input < 900000) {
+							// #pragma omp for
+							for (int i = 0;i < NUM_FEATURES + 3; i++) {
+								input_data[size_input][i] = input_data_from_function[i];
+							}
+							size_input++;
+						}
+					}
+				}
+			}
+		}
+		// print("%d \n", prediction);
+		usleep(100); // usahakan sekecil mungkin untuk menghindari antrian yg terlalu besar jika traffic padat
+	}
+}
+
+uint32_t float_to_network_byte_order(float value)
+{
+	// Reinterpret the float as a 32-bit integer
+	uint32_t temp;
+	memcpy(&temp, &value, sizeof(temp)); // Copy float bits into uint32_t
+	// Convert the integer to network byte order
+	return temp;
+}
+
+void handle_predict()
+{
+	while (!exit_xdpdump) {
+		{
+			int prediction = 0;
+
+#pragma omp critical(predict)
+
+			{
+				for (int i = 0; i < size_input; i++) {
+					double start_predict = omp_get_wtime();
+					prediction = sonar_predict(
+						input_data[i], NUM_FEATURES);
+					double end_predict = omp_get_wtime();
+
+					// will be fixed
+					struct in_addr addr;
+					addr.s_addr = htonl(
+						float_to_network_byte_order(
+							input_data[i]
+								  [81])); // Example IP 192.168.1.1 in hex
+
+					char ip_src[100];
+					strcpy(ip_src, inet_ntoa(addr));
+
+					struct in_addr addr2;
+					addr2.s_addr = htonl(
+						float_to_network_byte_order(
+							input_data[i]
+								  [82])); // Example IP 192.168.1.1 in hex
+
+					char ip_dst[100];
+					strcpy(ip_dst, inet_ntoa(addr2));
+
+					printf("%s, %s, %d, %d, %f - %f, result : %s\n",
+						       ip_src, ip_dst,
+						       (int)input_data[i][0],
+						       (int)input_data[i][83],
+						       start_predict,
+						       end_predict,
+							   (prediction==1) ? "Malicious" : "Benign" );
+				}
+				// #pragma omp atomic write
+				size_input = 0;
+			}
+		}
+
+		usleep(100); // check input_data variable every 10 microsecond
+	}
+
+	// Clean up
+	// #pragma omp critical(predict)
+	// bson_destroy(doc);
+	// mongoc_collection_destroy(collection);
+	// mongoc_client_destroy(client);
+	// mongoc_cleanup();
+	// printf("Kucing gila");
+}
+
+void handle_print()
+{
+	pid_t pid = getpid();
+	double first_h = omp_get_wtime();
+
+	while (!exit_xdpdump) {
+		sleep(1); //print every 1 sec
+		double now_h = omp_get_wtime();
+		// printf("time : %f, throughputs (Mbit/s) : %f \n",, );
+		get_process_info(pid, now_h,
+				 ((total_packets_byte * 8 / 1000000) /
+				  (now_h - first_h)));
+	}
+}
+
 /*****************************************************************************
  * main()
  *****************************************************************************/
 int main(int argc, char **argv)
 {
-	if (parse_cmdline_args(argc, argv, xdpdump_options,
-			       &cfg_dumpopt, sizeof(cfg_dumpopt),
-			       PROG_NAME, PROG_NAME,
+	if (parse_cmdline_args(argc, argv, xdpdump_options, &cfg_dumpopt,
+			       sizeof(cfg_dumpopt), PROG_NAME, PROG_NAME,
 			       "XDPDump tool to dump network traffic",
 			       &defaults_dumpopt) != 0)
 		return EXIT_FAILURE;
@@ -1936,8 +3244,8 @@ int main(int argc, char **argv)
 	/* Check if the system does not have more cores than we assume. */
 	if (sysconf(_SC_NPROCESSORS_CONF) > MAX_CPUS) {
 		pr_warn("ERROR: System has more cores (%ld) than maximum "
-			"supported (%d)!\n", sysconf(_SC_NPROCESSORS_CONF),
-			MAX_CPUS);
+			"supported (%d)!\n",
+			sysconf(_SC_NPROCESSORS_CONF), MAX_CPUS);
 		return EXIT_FAILURE;
 	}
 
@@ -1955,8 +3263,33 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (!capture_on_interface(&cfg_dumpopt))
-		return EXIT_FAILURE;
+	// return EXIT_SUCCESS;
+	// return EXIT_FAILURE;
+	int i;
+	// int thread_id;
+
+	cfg_dumpopt2 = cfg_dumpopt;
+	cfg_dumpopt2.iface = cfg_dumpopt2.iface2;
+
+	// omp_set_nested(1);
+	// omp_set_max_active_levels(2);
+#pragma omp parallel num_threads(4)
+
+#pragma omp for
+	for (i = 1; i <= 4; i++) {
+		// int thread_id = omp_get_thread_num();
+
+		if (i == 1)
+			capture_on_interface(&cfg_dumpopt);
+		else if (i == 2)
+			capture_on_interface(&cfg_dumpopt2);
+		else if (i == 3)
+			convert_flow();
+		else if (i == 4)
+			handle_predict();
+	}
+
+	printf("Total Flow %d", total_flow);
 
 	return EXIT_SUCCESS;
 }
