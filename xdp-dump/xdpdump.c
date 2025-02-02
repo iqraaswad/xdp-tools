@@ -2810,6 +2810,14 @@ void handle_predict()
 #pragma omp critical(predict)
 			{
 				for (int i = 0; i < size_input; i++) {
+
+					int aa = 0;
+
+					//normalize data
+					for(aa=0; aa<=NUM_FEATURES; aa++){
+						if(isnan(input_data[i][aa])) input_data[i][aa]=0;
+					}
+
 					double start_predict = omp_get_wtime();
 					prediction = sonar_predict(
 						input_data[i], NUM_FEATURES);
@@ -2828,10 +2836,11 @@ void handle_predict()
 					char ip_dst[100];
 					strcpy(ip_dst, inet_ntoa(addr2));
 
-					printf("%s, %s, %d, %d, Inference time %f (second), result : %s\n",
+					printf("%s, %s, %d, %d, %f, Inference time %f (second), result : %s\n",
 					       ip_src, ip_dst,
 					       (int)input_data[i][0],
 					       (int)input_data[i][83],
+						   start_predict,
 					       (end_predict-start_predict),
 					       (prediction == 1) ? "Malicious" :
 								   "Benign");
