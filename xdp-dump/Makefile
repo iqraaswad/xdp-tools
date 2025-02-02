@@ -15,6 +15,7 @@ MONGODB_LIBS   := $(shell pkg-config --libs libmongoc-1.0 libbson-1.0)
 # -Wno-gnu-variable-sized-type-not-at-end
 CFLAGS 	     += "-fopenmp"
 CFLAGS       += "-Wno-unused-variable"
+CFLAGS		 += "-flarge-source-files"
 CFLAGS       += "-Wno-unused-parameter"
 CFLAGS       += "-Wno-unused-but-set-variable"
 CFLAGS       += "-I."

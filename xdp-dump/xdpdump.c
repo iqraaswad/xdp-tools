@@ -50,19 +50,13 @@
 #include "xpcapng.h"
 #include "compat.h"
 #include "math.h"
+#include "custom.h"
 /*****************************************************************************
  * Local definitions and global variables
  *****************************************************************************/
 #define PROG_NAME "xdpdump"
 #define DEFAULT_SNAP_LEN 262144
-#define IDLE_TIMEOUT 1000
-#define NUM_FEATURES 81
-#define CLUMP_TIMEOUT 1
-#define BULK_BOUND 4
-bool isNew = 0;
-bool isNewFlow = 0;
-const int subflow_max_iat = 1;
-int total_flow = 0;
+// #define IDLE_TIMEOUT 1000
 
 #ifndef ENOTSUPP
 #define ENOTSUPP 524 /* Operation is not supported */
@@ -81,172 +75,9 @@ struct enum_val xdp_modes[] = { { "native", XDP_MODE_NATIVE },
 				{ "unspecified", XDP_MODE_UNSPEC },
 				{ NULL, 0 } };
 
-struct flow_tuple {
-	uint32_t src_ip;
-	uint32_t dst_ip;
-	uint16_t src_port;
-	uint16_t dst_port;
-	uint8_t protocol;
-};
-
-struct will_be_used {
-	int payload_size;
-	struct in_addr src_ip;
-	struct in_addr dst_ip;
-	uint16_t src_port;
-	uint16_t dst_port;
-	uint8_t protocol;
-	bool direction; //1 -> Forward, 0 -> Backward
-	u_int flag;
-	double timestamp;
-};
-
-#define TABLE_SIZE_A 300000
-struct will_be_used buff__table[TABLE_SIZE_A];
-
-int size = 0;
-void addStructElement(struct will_be_used new_element)
-{
-	// #pragma omp critical
-	if (size < TABLE_SIZE_A) {
-		buff__table[size] =
-			new_element; // Add the new element at the end
-		// #pragma omp atomic
-		size++; // Increase the size count
-	} else {
-		printf("Table is full, cannot add more elements.\n");
-	}
-}
-
-
-// Data structure to store flow timing information
-struct flow_info {
-	double start_time;
-	double end_time;
-	double ssquare_payload;
-	double fwd_data_pkts_tot;
-	double bwd_data_pkts_tot;
-	double fwd_ssquare_payload;
-	double bwd_ssquare_payload;
-
-	// duplicate features (by cicflowmeter)
-	double fwd_pkt_len_mean;
-	double bwd_pkt_len_mean;
-	double fwd_urg_flags;
-	int fwd_pkts_tot;
-	int bwd_pkts_tot;
-	double totlen_fwd_pkts;
-	double totlen_bwd_pkts;
-
-	// end
-
-	// additional
-
-	double backward_bulk_last_timestamp;
-	double forward_bulk_start_tmp;
-	double forward_bulk_last_timestamp;
-	double forward_bulk_size_tmp;
-	double forward_bulk_count_tmp;
-	double forward_bulk_packet_count;
-	double forward_bulk_count;
-	double forward_bulk_size;
-	double forward_bulk_duration;
-	double backward_bulk_count;
-	double backward_bulk_count_tmp;
-	double backward_bulk_start_tmp;
-	double backward_bulk_size_tmp;
-	double backward_bulk_packet_count;
-	double backward_bulk_size;
-	double backward_bulk_duration;
-
-	// end
-	double fwd_ssquare_iat;
-	double bwd_ssquare_iat;
-	double ssquare_iat;
-
-	float fwd_pkts_per_sec;
-	float bwd_pkts_per_sec;
-	int fwd_header_size_tot;
-	int fwd_header_size_min;
-	int fwd_header_size_max;
-	int bwd_header_size_tot;
-	int bwd_header_size_min;
-	int bwd_header_size_max;
-	int flow_FIN_flag_count;
-	int flow_SYN_flag_count;
-	int flow_RST_flag_count;
-	int fwd_PSH_flag_count;
-	int bwd_PSH_flag_count;
-	int flow_ACK_flag_count;
-	int fwd_URG_flag_count;
-	int bwd_URG_flag_count;
-	int flow_CWR_flag_count;
-	int flow_ECE_flag_count;
-	int fwd_pkts_payload_min;
-	int fwd_pkts_payload_max;
-	int fwd_pkts_payload_count;
-	int fwd_pkts_payload_tot;
-	double fwd_pkts_payload_avg;
-	double fwd_pkts_payload_std;
-	int bwd_pkts_payload_min;
-	int bwd_pkts_payload_max;
-	int bwd_pkts_payload_count;
-	int bwd_pkts_payload_tot;
-	double bwd_pkts_payload_avg;
-	double bwd_pkts_payload_std;
-	int flow_pkts_payload_min;
-	int flow_pkts_payload_max;
-	int flow_pkts_payload_tot;
-	int flow_pkts_payload_count;
-	double flow_pkts_payload_avg;
-	double flow_pkts_payload_std;
-	double fwd_iat_min;
-	double fwd_iat_max;
-	double fwd_iat_tot;
-	double fwd_iat_avg;
-	int fwd_iat_count;
-	double fwd_iat_std;
-
-	double bwd_iat_min;
-	double bwd_iat_max;
-	double bwd_iat_tot;
-	double bwd_iat_avg;
-	int bwd_iat_count;
-	double bwd_iat_std;
-
-	double flow_iat_min;
-	double flow_iat_max;
-	double flow_iat_tot;
-	double flow_iat_avg;
-	int flow_iat_count;
-	double flow_iat_std;
-
-	int total_payload;
-
-	double active_min;
-	double active_max;
-	double active_tot;
-	double active_std;
-	double active_duration;
-	double active_avg;
-};
 
 double start_capture[6] = { 0, 0, 0, 0, 0, 0 };
 double end_capture[6] = { 0, 0, 0, 0, 0, 0 };
-float total_packets_byte = 0;
-
-#define HASH_TABLE_SIZE 900240
-struct flow_info *flow_table[HASH_TABLE_SIZE];
-
-int size_input = 0;
-float input_data[900000][NUM_FEATURES + 3];
-
-unsigned int hash_flow(struct flow_tuple *key)
-{
-	return (key->src_ip ^ key->dst_ip ^ key->src_port ^ key->dst_port ^
-		key->protocol) %
-	       HASH_TABLE_SIZE;
-}
 
 #define n 2
 static const struct dumpopt {
@@ -282,6 +113,7 @@ const struct sniff_tcp *tcp;
 u_int size_ip;
 u_int size_tcp;
 u_int flag;
+
 static struct prog_option xdpdump_options[] = {
 	DEFINE_OPTION("rx-capture", OPT_FLAGS, struct dumpopt, rx_capture,
 		      .metavar = "<mode>", .typearg = rx_capture_flags,
@@ -401,6 +233,7 @@ static uint64_t get_if_speed(struct iface *iface)
 	    ereq.req.link_mode_masks_nwords < -MAX_MODE_MASKS ||
 	    ereq.req.cmd != ETHTOOL_GLINKSETTINGS)
 		goto error_exit;
+
 
 	/* Now ask for the data set, and extract the speed in bps. */
 	ereq.req.link_mode_masks_nwords = -ereq.req.link_mode_masks_nwords;
@@ -756,7 +589,6 @@ handle_perf_event(void *private_data, int cpu, struct perf_event_header *event)
 
 					ctx->captured_packets++;
 
-					isNew = true;
 				}
 			}
 		}
@@ -1150,6 +982,15 @@ static int match_target_function(struct dumpopt *cfg,
 	}
 
 	return -EAGAIN;
+}
+
+uint32_t float_to_network_byte_order(float value)
+{
+	// Reinterpret the float as a 32-bit integer
+	uint32_t temp;
+	memcpy(&temp, &value, sizeof(temp)); // Copy float bits into uint32_t
+	// Convert the integer to network byte order
+	return temp;
 }
 
 /*****************************************************************************
@@ -1679,6 +1520,7 @@ rlimit_loop:
 		progs->progs[idx].perf_map_fd = progs->progs[0].perf_map_fd;
 	}
 
+
 	progs->progs[idx].attached = true;
 	progs->progs[idx].fentry_link = trace_link_fentry;
 	progs->progs[idx].fexit_link = trace_link_fexit;
@@ -1888,17 +1730,7 @@ static bool capture_on_interface(struct dumpopt *cfg)
 			IS_ERR_OR_NULL(mp) ? "" : " in software");
 		load_xdp = true;
 	}
-	// int number_of_seconds = 100;
-	// int milli_seconds = 1000 * number_of_seconds;
 
-	// Storing start time
-	// clock_t start_time = clock();
-
-	// looping till required time is not achieved
-	// while (clock() < start_time + milli_seconds) {
-	// 	printf("Hello from process: %d\n", omp_get_thread_num());
-	// };
-	// goto error_exit;
 	if (!load_xdp) {
 		if (find_target(cfg, mp, &tgt_progs))
 			goto error_exit;
@@ -2167,16 +1999,6 @@ void get_process_info(pid_t pid, double time_h, double throughput)
 	if (pclose(fp) == -1) {
 		perror("pclose failed");
 	}
-}
-
-float network_byte_order_to_float(uint32_t value)
-{
-	// Convert from network byte order to host byte order
-	uint32_t temp = ntohl(value);
-	// Reinterpret the integer as a float
-	float result;
-	memcpy(&result, &temp, sizeof(result)); // Copy bits back into float
-	return result;
 }
 
 void convert_flow()
@@ -2975,19 +2797,10 @@ void convert_flow()
 				}
 			}
 		}
-		// print("%d \n", prediction);
 		usleep(100); // usahakan sekecil mungkin untuk menghindari antrian yg terlalu besar jika traffic padat
 	}
 }
 
-uint32_t float_to_network_byte_order(float value)
-{
-	// Reinterpret the float as a 32-bit integer
-	uint32_t temp;
-	memcpy(&temp, &value, sizeof(temp)); // Copy float bits into uint32_t
-	// Convert the integer to network byte order
-	return temp;
-}
 
 void handle_predict()
 {
@@ -3004,30 +2817,25 @@ void handle_predict()
 						input_data[i], NUM_FEATURES);
 					double end_predict = omp_get_wtime();
 
-					// will be fixed
 					struct in_addr addr;
 					addr.s_addr = htonl(
-						float_to_network_byte_order(
-							input_data[i]
-								  [81])); // Example IP 192.168.1.1 in hex
+						float_to_network_byte_order(input_data[i][81])); // Example IP 192.168.1.1 in hex
 
 					char ip_src[100];
 					strcpy(ip_src, inet_ntoa(addr));
 
 					struct in_addr addr2;
 					addr2.s_addr = htonl(
-						float_to_network_byte_order(
-							input_data[i]
-								  [82])); // Example IP 192.168.1.1 in hex
+						float_to_network_byte_order(input_data[i][82])); // Example IP 192.168.1.1 in hex
 
 					char ip_dst[100];
 					strcpy(ip_dst, inet_ntoa(addr2));
 
-					printf("%s, %s, %d, %d, %f - %f, result : %s\n",
+					printf("%s, %s, %d, %d, %f, result : %s\n",
 					       ip_src, ip_dst,
 					       (int)input_data[i][0],
 					       (int)input_data[i][83],
-					       start_predict, end_predict,
+					       (end_predict-start_predict),
 					       (prediction == 1) ? "Malicious" :
 								   "Benign");
 				}
@@ -3039,29 +2847,8 @@ void handle_predict()
 		usleep(100); // check input_data variable every 10 microsecond
 	}
 
-	// Clean up
-	// #pragma omp critical(predict)
-	// bson_destroy(doc);
-	// mongoc_collection_destroy(collection);
-	// mongoc_client_destroy(client);
-	// mongoc_cleanup();
-	// printf("Kucing gila");
 }
 
-void handle_print()
-{
-	pid_t pid = getpid();
-	double first_h = omp_get_wtime();
-
-	while (!exit_xdpdump) {
-		sleep(1); //print every 1 sec
-		double now_h = omp_get_wtime();
-		// printf("time : %f, throughputs (Mbit/s) : %f \n",, );
-		get_process_info(pid, now_h,
-				 ((total_packets_byte * 8 / 1000000) /
-				  (now_h - first_h)));
-	}
-}
 
 /*****************************************************************************
  * main()
@@ -3113,22 +2900,15 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	// return EXIT_SUCCESS;
-	// return EXIT_FAILURE;
 	int i;
-	// int thread_id;
 
 	cfg_dumpopt2 = cfg_dumpopt;
 	cfg_dumpopt2.iface = cfg_dumpopt2.iface2;
 
-	// omp_set_nested(1);
-	// omp_set_max_active_levels(2);
 #pragma omp parallel num_threads(4)
 
 #pragma omp for
 	for (i = 1; i <= 4; i++) {
-		// int thread_id = omp_get_thread_num();
-
 		if (i == 1)
 			capture_on_interface(&cfg_dumpopt);
 		else if (i == 2)
@@ -3139,7 +2919,6 @@ int main(int argc, char **argv)
 			handle_predict();
 	}
 
-	printf("Total Flow %d", total_flow);
-
+	fprintf(stderr, "Total Flow %d\n", total_flow);
 	return EXIT_SUCCESS;
 }
