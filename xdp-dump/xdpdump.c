@@ -293,10 +293,6 @@ exit:
 	return r_buffer;
 }
 
-#define INITIAL_CAPACITY 1000
-#define MAX_CAPACITY 100000 // Increase maximum capacity to 100,000
-
-
 /*****************************************************************************
  * set_if_promiscuous_mode()
  *****************************************************************************/
@@ -576,7 +572,7 @@ handle_perf_event(void *private_data, int cpu, struct perf_event_header *event)
 						new_entry.dst_port = sport;
 						new_entry.direction = 1;
 					};
-					
+
 
 					if (sport == 443) //Backward
 					{
@@ -2812,14 +2808,12 @@ void handle_predict()
 			int prediction = 0;
 
 #pragma omp critical(predict)
-
 			{
 				for (int i = 0; i < size_input; i++) {
 					double start_predict = omp_get_wtime();
 					prediction = sonar_predict(
 						input_data[i], NUM_FEATURES);
 					double end_predict = omp_get_wtime();
-
 					struct in_addr addr;
 					addr.s_addr = htonl(
 						float_to_network_byte_order(input_data[i][81])); // Example IP 192.168.1.1 in hex
@@ -2834,7 +2828,7 @@ void handle_predict()
 					char ip_dst[100];
 					strcpy(ip_dst, inet_ntoa(addr2));
 
-					printf("%s, %s, %d, %d, %f, result : %s\n",
+					printf("%s, %s, %d, %d, Inference time %f (second), result : %s\n",
 					       ip_src, ip_dst,
 					       (int)input_data[i][0],
 					       (int)input_data[i][83],
