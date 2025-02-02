@@ -563,7 +563,9 @@ handle_perf_event(void *private_data, int cpu, struct perf_event_header *event)
 					struct will_be_used new_entry;
 					new_entry.payload_size = ip->ip_len;
 					new_entry.timestamp = omp_get_wtime();
-					new_entry.flag = flag;
+					new_entry.flag = tcp->th_flags;
+					new_entry.size_ip = size_ip;
+					new_entry.size_tcp = size_tcp;
 					new_entry.protocol = 6;
 
 					if (dport == 443) //Forward
@@ -574,6 +576,7 @@ handle_perf_event(void *private_data, int cpu, struct perf_event_header *event)
 						new_entry.dst_port = sport;
 						new_entry.direction = 1;
 					};
+					
 
 					if (sport == 443) //Backward
 					{
@@ -2051,17 +2054,17 @@ void convert_flow()
 
 					flow_duration = flow_entry->end_time -
 							flow_entry->start_time;
-					flag = tcp->th_flags;
+					flag = buff__table[i].flag;
 
 					int payload_size =
 						buff__table[i].payload_size -
-						(size_ip + size_tcp);
+						(buff__table[i].size_ip + buff__table[i].size_tcp);
 					flow_entry->total_payload +=
 						payload_size;
 
 					int header_size;
-					header_size = SIZE_ETHERNET + size_ip +
-						      size_tcp;
+					header_size = SIZE_ETHERNET +  buff__table[i].size_ip +
+						      buff__table[i].size_tcp;
 
 					flow_entry->ssquare_iat +=
 						(double)(iat * iat);
