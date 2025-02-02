@@ -26,6 +26,8 @@ struct will_be_used {
 	uint8_t protocol;
 	bool direction; //1 -> Forward, 0 -> Backward
 	u_int flag;
+    u_int size_ip;
+    u_int size_tcp;
 	double timestamp;
 };
 
