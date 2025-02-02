@@ -20,7 +20,7 @@ extern "C" {
 
 typedef struct _EmlTreesNode {
     int8_t feature;
-    float value;
+    double value;
     int16_t left;
     int16_t right;
 } EmlTreesNode;

@@ -2695,7 +2695,7 @@ void convert_flow()
 					if (buff__table[i].flag & 0x40)
 						flow_entry->flow_ECE_flag_count++;
 
-					float input_data_from_function[NUM_FEATURES + 3] = {
+					double input_data_from_function[NUM_FEATURES + 4] = {
 						buff__table[i].src_port,
 						flow_duration,
 						flow_entry->fwd_pkts_tot,
@@ -2778,7 +2778,8 @@ void convert_flow()
 						fwd_last_window_size,
 						bwd_last_window_size,
 						network_byte_order_to_float(buff__table[i].src_ip.s_addr),
-						network_byte_order_to_float(buff__table[i].dst_ip.s_addr),buff__table[i].dst_port};
+						network_byte_order_to_float(buff__table[i].dst_ip.s_addr),buff__table[i].dst_port,
+						buff__table[i].timestamp};
 					size = 0;
 #pragma omp critical(predict)
 					{
@@ -2786,7 +2787,7 @@ void convert_flow()
 							// #pragma omp for
 							for (int i = 0;
 							     i <
-							     NUM_FEATURES + 3;
+							     NUM_FEATURES + 4;
 							     i++) {
 								input_data[size_input][i] = input_data_from_function[i];
 							}
@@ -2840,7 +2841,7 @@ void handle_predict()
 					       ip_src, ip_dst,
 					       (int)input_data[i][0],
 					       (int)input_data[i][83],
-						   start_predict,
+						   input_data[i][84],
 					       (end_predict-start_predict),
 					       (prediction == 1) ? "Malicious" :
 								   "Benign");

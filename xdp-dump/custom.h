@@ -142,7 +142,7 @@ struct flow_info {
 
 struct flow_info *flow_table[HASH_TABLE_SIZE];
 
-float input_data[900000][NUM_FEATURES + 3];
+double input_data[900000][NUM_FEATURES + 4];
 float total_packets_byte = 0;
 
 //this function used to create hash flow
