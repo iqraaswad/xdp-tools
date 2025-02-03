@@ -34,9 +34,11 @@ struct will_be_used {
 #define TABLE_SIZE_A 300000
 struct will_be_used buff__table[TABLE_SIZE_A];
 
+
+
 // Data structure to store flow timing information
 struct flow_info {
-	double start_time;
+	double start_time;	
 	double end_time;
 	double ssquare_payload;
 	double fwd_data_pkts_tot;
@@ -136,21 +138,54 @@ struct flow_info {
 	double active_std;
 	double active_duration;
 	double active_avg;
+
+	int count;
 };
 
 #define HASH_TABLE_SIZE 900000
 
+int countflow[HASH_TABLE_SIZE];
 struct flow_info *flow_table[HASH_TABLE_SIZE];
 
 double input_data[900000][NUM_FEATURES + 4];
 float total_packets_byte = 0;
 
-//this function used to create hash flow
-unsigned int hash_flow(struct flow_tuple *key)
-{
-	return (key->src_ip ^ key->dst_ip ^ key->src_port ^ key->dst_port ^
-		key->protocol) %
-	       HASH_TABLE_SIZE;
+// djb2 hash function
+unsigned int hash_djb2(const void *data, size_t length) {
+    const unsigned char *str = (const unsigned char *)data;
+    unsigned int hash = 5381;
+    size_t i;
+
+    for (i = 0; i < length; ++i) {
+        hash = ((hash << 5) + hash) + str[i];  // hash * 33 + str[i]
+    }
+
+    return hash;
+}
+
+
+
+//this function used to create hash flow 
+// unsigned int hash_flow(struct flow_tuple *key)
+// {
+// 	return (key->src_ip ^ key->dst_ip ^ key->src_port ^ key->dst_port ^
+// 		key->protocol) %
+// 	       HASH_TABLE_SIZE;
+// }
+
+// Hash function for the flow tuple (usingdjb2 algorithm)
+unsigned int hash_flow(struct flow_tuple *key) {
+    // Concatenate the flow tuple fields into a buffer
+    unsigned char buffer[16];  // 4 + 4 + 2 + 2 + 1 bytes
+    memcpy(buffer, &key->src_ip, 4);
+    memcpy(buffer + 4, &key->dst_ip, 4);
+    memcpy(buffer + 8, &key->src_port, 2);
+    memcpy(buffer + 10, &key->dst_port, 2);
+    memcpy(buffer + 12, &key->protocol, 1);
+
+    unsigned int hash = hash_djb2(buffer, sizeof(buffer));
+
+    return hash % HASH_TABLE_SIZE;
 }
 
 //this function used to convert from network byte order to host byte order
