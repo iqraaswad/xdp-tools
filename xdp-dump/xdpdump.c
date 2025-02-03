@@ -1970,36 +1970,6 @@ static void signal_handler(__unused int signo)
 		pcap_breakloop(exit_pcap);
 }
 
-void get_process_info(pid_t pid, double time_h, double throughput)
-{
-	char command[100];
-	snprintf(
-		command, sizeof(command),
-		"ps -p %d -o pid,%%cpu,tid,vsz -T | sed -n '2p;3p' | paste -sd ';' | sed 's/ /;/g'",
-		pid); // Prepare the command
-
-	FILE *fp;
-	char buffer[256];
-
-	// Open the command for reading
-	fp = popen(command, "r");
-	if (fp == NULL) {
-		perror("popen failed");
-		return;
-	}
-
-	// Read the output line by line
-	while (fgets(buffer, sizeof(buffer), fp) != NULL) {
-		printf("%f;%f;%s", time_h, throughput,
-		       buffer); // Print the output
-	}
-
-	// Close the pipe
-	if (pclose(fp) == -1) {
-		perror("pclose failed");
-	}
-}
-
 void convert_flow()
 {
 	while (!exit_xdpdump) {
@@ -2013,36 +1983,49 @@ void convert_flow()
 				flow.protocol = IPPROTO_TCP;
 				flow.src_ip = buff__table[i].src_port;
 				flow.dst_ip = buff__table[i].dst_port;
+			
 				unsigned int index = hash_flow(&flow);
+				//if flow doesnt exist
 				if (flow_table[index] == NULL) {
 					total_flow++;
-					flow_table[index] = (struct flow_info *)
-						malloc(sizeof(
-							struct flow_info));
-					memset(flow_table[index], 0,
-					       sizeof(struct flow_info));
+					flow_table[index] = (struct flow_info *) malloc(sizeof(struct flow_info));
+					memset(flow_table[index], 0, sizeof(struct flow_info));
+					struct flow_info *flow_entry = flow_table[index];
 
 					if (flow_table[index] == NULL) {
 						perror("Failed to allocate memory");
 						exit(EXIT_FAILURE);
 					} else {
-						struct flow_info *flow_entry =
-							flow_table[index];
-						flow_entry->start_time =
-							buff__table[i].timestamp;
+						struct flow_info *flow_entry = flow_table[index];
+						flow_entry->start_time = buff__table[i].timestamp;
 					}
+				}  
+				
+				
+
+				struct flow_info *flow_entry = flow_table[index];
+
+				// create new flow after timeout (based on cicflowmeter)
+				
+				if(buff__table[i].timestamp - flow_entry->end_time > 40){
+					total_flow++;
+					// reset spesific flow_table for new packet flow
+					
+					flow_table[index] = (struct flow_info *) malloc(sizeof(struct flow_info));
+					memset(flow_table[index], 0, sizeof(struct flow_info));
+					flow_entry->start_time = buff__table[i].timestamp;
 				}
 
+				
+	
 				//
 				{
 					struct flow_info *flow_entry =
 						flow_table[index];
-
 					// int fwd_data_pkts_tot = 0;
 					double end_time_temp =
 						buff__table[i].timestamp;
-					double iat = end_time_temp -
-						     flow_entry->end_time;
+					double iat = end_time_temp - flow_entry->end_time;
 
 					flow_entry->end_time = end_time_temp;
 
@@ -2408,23 +2391,13 @@ void convert_flow()
 									flow_entry
 										->backward_bulk_count_tmp >
 									BULK_BOUND) {
-									flow_entry
-										->backward_bulk_packet_count++;
-									flow_entry
-										->backward_bulk_size +=
-										buff__table[i]
-											.payload_size;
+									flow_entry->backward_bulk_packet_count++;
+									flow_entry->backward_bulk_size += buff__table[i].payload_size;
 									flow_entry
 										->backward_bulk_duration +=
-										(buff__table[i]
-											 .timestamp -
-										 flow_entry
-											 ->backward_bulk_last_timestamp);
+										(buff__table[i].timestamp - flow_entry->backward_bulk_last_timestamp);
 								}
-								flow_entry
-									->backward_bulk_last_timestamp =
-									buff__table[i]
-										.timestamp;
+								flow_entry->backward_bulk_last_timestamp = buff__table[i].timestamp;
 							}
 						}
 						//end of bulk packets
@@ -2778,10 +2751,12 @@ void convert_flow()
 						fwd_last_window_size,
 						bwd_last_window_size,
 						network_byte_order_to_float(buff__table[i].src_ip.s_addr),
-						network_byte_order_to_float(buff__table[i].dst_ip.s_addr),buff__table[i].dst_port,
+						network_byte_order_to_float(buff__table[i].dst_ip.s_addr),
+						buff__table[i].dst_port,
 						buff__table[i].timestamp};
 					size = 0;
 #pragma omp critical(predict)
+				
 					{
 						if (size_input < 900000) {
 							// #pragma omp for
@@ -2795,7 +2770,10 @@ void convert_flow()
 						}
 					}
 				}
+
 			}
+			
+	
 		}
 		usleep(100); // usahakan sekecil mungkin untuk menghindari antrian yg terlalu besar jika traffic padat
 	}
