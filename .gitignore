@@ -69,3 +69,4 @@ compile_commands.json
 
 output.txt
 xdp-dump/output.txt
+xdp-dump/a.out
